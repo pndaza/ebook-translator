@@ -4,7 +4,6 @@
 
   let apiKey = $state("");
   let model = $state("");
-  let lang = $state("");
   let instructions = $state("");
   let testing = $state(false);
   let testResult = $state<{ ok: boolean; text: string } | null>(null);
@@ -15,7 +14,6 @@
     if (app.settingsOpen && app.settings) {
       apiKey = app.settings.apiKey;
       model = app.settings.model;
-      lang = app.settings.targetLang;
       instructions = app.settings.customInstructions;
       testResult = null;
     }
@@ -73,15 +71,13 @@
       await saveSettings({
         apiKey: apiKey.trim(),
         model,
-        targetLang: lang,
-        mode: app.settings?.mode ?? "bilingual",
+        mode: app.form?.mode ?? "translated",
         customInstructions: instructions,
       });
       app.settings = {
         apiKey: apiKey.trim(),
         model,
-        targetLang: lang,
-        mode: app.settings?.mode ?? "bilingual",
+        mode: app.form?.mode ?? "translated",
         customInstructions: instructions,
       };
       close();
@@ -133,11 +129,6 @@
       {#if testResult}
         <p class="result" class:bad={!testResult.ok} role="status">{testResult.text}</p>
       {/if}
-
-      <div class="field">
-        <label for="dlang">Default target language</label>
-        <input id="dlang" type="text" bind:value={lang} placeholder="e.g. Burmese (မြန်မာ)" />
-      </div>
 
       <div class="field">
         <label for="instr">Translator instructions <span class="opt">optional</span></label>

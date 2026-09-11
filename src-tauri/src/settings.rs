@@ -8,7 +8,6 @@ use std::path::PathBuf;
 pub struct Settings {
     pub api_key: String,
     pub model: String,
-    pub target_lang: String,
     pub mode: String,
     pub custom_instructions: String,
 }
@@ -19,7 +18,6 @@ impl Default for Settings {
         Self {
             api_key: String::new(),
             model: o.model,
-            target_lang: o.target_lang,
             mode: o.mode,
             custom_instructions: o.custom_instructions,
         }

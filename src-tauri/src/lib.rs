@@ -51,6 +51,7 @@ pub fn run() {
             commands::save_output,
             commands::get_current_book,
             commands::get_job_progress,
+            commands::estimate_requests,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

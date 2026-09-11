@@ -38,7 +38,7 @@ impl Default for JobOptions {
     fn default() -> Self {
         Self {
             target_lang: "Burmese".into(),
-            mode: "bilingual".into(),
+            mode: MODE_TRANSLATED.into(),
             model: "gemini-3.5-flash-lite".into(),
             custom_instructions: String::new(),
         }

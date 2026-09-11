@@ -1,27 +1,49 @@
 <script lang="ts">
-  import { startJob, formatChars, LANGUAGES, MODELS, MODEL_RATE_HINT } from "$lib/api";
-  import { app } from "$lib/stores.svelte";
+  import {
+    startJob,
+    formatChars,
+    estimateRequests,
+    LANGUAGES,
+    MODELS,
+    MODEL_RATE_HINT,
+  } from "$lib/api";
+  import { app, resetBook } from "$lib/stores.svelte";
 
   let { onstart }: { onstart: () => void } = $props();
-
-  let lang = $state("");
-  let mode = $state("bilingual");
-  let model = $state("gemini-3.5-flash-lite");
-  let starting = $state(false);
 
   // Seed once: carry over choices from a previous visit of this form if any,
   // otherwise fall back to the saved defaults. The $effect below syncs the
   // store as the user edits (and on first mount), so "Back to book" keeps
   // their language — and the language-keyed resume cache stays valid.
-  if (app.form) {
-    lang = app.form.lang;
-    mode = app.form.mode;
-    model = app.form.model;
-  } else {
-    lang = app.settings?.targetLang || LANGUAGES[0];
-    mode = app.settings?.mode || "bilingual";
-    model = app.settings?.model || "gemini-3.5-flash-lite";
+  const seeded = app.form ?? {
+    lang: LANGUAGES[0],
+    mode: "translated",
+    model: app.settings?.model || "gemini-3.5-flash-lite",
+  };
+  // The language picker offers two options; anything left over from an older
+  // default (or a free-typed settings value) falls back to Burmese.
+  if (!LANGUAGES.includes(seeded.lang)) {
+    seeded.lang = LANGUAGES[0];
   }
+
+  let lang = $state(seeded.lang);
+  let mode = $state(seeded.mode);
+  let model = $state(seeded.model);
+  let starting = $state(false);
+  let requests = $state<number | null>(null);
+
+  // Re-run the real batcher for the loaded book whenever the model changes.
+  $effect(() => {
+    const m = model;
+    estimateRequests(m)
+      .then((n) => {
+        if (m === model) requests = n;
+      })
+      .catch(() => {
+        if (m === model) requests = null;
+      });
+  });
+
   $effect(() => {
     app.form = { lang, mode, model };
   });
@@ -57,21 +79,22 @@
 
 {#if book}
   <article class="card">
-    <div class="overview">
-      {#if book.coverDataUrl}
-        <img class="cover" src={book.coverDataUrl} alt="" />
-      {:else}
-        <div class="cover blank"><span>{book.format === "pdf" ? "PDF" : "EPUB"}</span></div>
-      {/if}
-      <div class="meta">
-        <p class="kind">{book.format === "pdf" ? "PDF document" : "EPUB edition"}</p>
+    <div class="split">
+      <div class="overview">
+        {#if book.coverDataUrl}
+          <img class="cover" src={book.coverDataUrl} alt="" />
+        {:else}
+          <div class="cover blank"><span>{book.format.toUpperCase()}</span></div>
+        {/if}
         <h2>{book.title}</h2>
-        {#if book.author}<p class="author">{book.author}</p>{/if}
+        <p class="byline">
+          {#if book.author}{book.author} · {/if}{book.format === "pdf" ? "PDF" : "EPUB"}
+        </p>
         <p class="stats">
-          <span class="mono">{book.segments.length}</span>
+          {book.segments.length}
           {book.segments.length === 1 ? "section" : "sections"} ·
-          <span class="mono">{formatChars(book.totalChars)}</span> ·
-          <span class="mono">{book.segments.reduce((n, s) => n + s.blocks, 0)}</span> paragraphs
+          {book.segments.reduce((n, s) => n + s.blocks, 0)} paragraphs ·
+          {formatChars(book.totalChars)}
         </p>
         {#if book.warnings.length}
           <p class="warn" role="alert">
@@ -79,174 +102,146 @@
           </p>
         {/if}
       </div>
-    </div>
 
-    <div class="form">
-      <div class="row">
-        <div class="field grow">
+      <div class="form">
+        <div class="field">
           <label for="lang">Translate into</label>
-          <input id="lang" list="langs" type="text" bind:value={lang} placeholder="Language" />
-          <datalist id="langs">
-            {#each LANGUAGES as l}<option value={l}></option>{/each}
-          </datalist>
+          <select id="lang" bind:value={lang}>
+            {#each LANGUAGES as l}<option value={l}>{l}</option>{/each}
+          </select>
         </div>
+
         <div class="field">
           <label for="model">Model</label>
           <select id="model" bind:value={model}>
             {#each MODELS as m}<option value={m.id}>{m.label}</option>{/each}
           </select>
           <p class="rate-hint">{MODEL_RATE_HINT}</p>
+          {#if requests !== null}
+            <p class="estimate">≈ {requests} requests for this book</p>
+          {/if}
         </div>
-      </div>
 
-      <div class="field">
-        <span class="label" id="output-label">Output</span>
-        <div class="facing" role="radiogroup" aria-label="Output mode">
-          <button
-            type="button"
-            class="face"
-            class:on={mode === "bilingual"}
-            role="radio"
-            aria-checked={mode === "bilingual"}
-            onclick={() => (mode = "bilingual")}>
-            <span class="pg a">The quick fox</span>
-            <span class="pg b">မြန်မာလို</span>
-            <span class="face-name">Bilingual</span>
-            <span class="face-sub">translation after each paragraph</span>
-          </button>
-          <button
-            type="button"
-            class="face"
-            class:on={mode === "translated"}
-            role="radio"
-            aria-checked={mode === "translated"}
-            onclick={() => (mode = "translated")}>
-            <span class="pg a only">မြန်မာလို</span>
-            <span class="face-name">Translation only</span>
-            <span class="face-sub">replaces the original text</span>
-          </button>
+        <div class="field">
+          <span class="label" id="output-label">Output</span>
+          <div class="segmented" role="radiogroup" aria-labelledby="output-label">
+            <button
+              type="button"
+              role="radio"
+              class:on={mode === "translated"}
+              aria-checked={mode === "translated"}
+              onclick={() => (mode = "translated")}>
+              Translation only
+            </button>
+            <button
+              type="button"
+              role="radio"
+              class:on={mode === "bilingual"}
+              aria-checked={mode === "bilingual"}
+              onclick={() => (mode = "bilingual")}>
+              Bilingual
+            </button>
+          </div>
         </div>
-      </div>
-
-      <div class="actions">
-        {#if noKey}
-          <p class="hint">
-            No API key yet — <button class="linkish" onclick={() => (app.settingsOpen = true)}>add your Google AI Studio key</button> to start.
-          </p>
-        {/if}
-        <button class="btn btn-primary" disabled={noKey || starting || !lang.trim()} onclick={begin}>
-          {starting ? "Starting…" : `Translate to ${lang.split(" (")[0]}`}
-        </button>
       </div>
     </div>
 
     {#if app.error}
       <p class="error" role="alert">{app.error}</p>
     {/if}
+
+    <footer class="actions">
+      {#if noKey}
+        <p class="hint">
+          No API key yet — <button class="linkish" onclick={() => (app.settingsOpen = true)}>add your Google AI Studio key</button> to start.
+        </p>
+      {/if}
+      <div class="btn-group">
+        <button class="btn btn-ghost" disabled={starting} onclick={resetBook}>Cancel</button>
+        <button class="btn btn-primary" disabled={noKey || starting || !lang.trim()} onclick={begin}>
+          {starting ? "Starting…" : `Translate to ${lang.split(" (")[0]}`}
+        </button>
+      </div>
+    </footer>
   </article>
 {/if}
 
 <style>
   .card {
-    width: min(680px, 100%);
+    width: min(690px, 100%);
     background: var(--paper);
     border-radius: var(--radius);
     box-shadow: 0 14px 40px rgba(6, 12, 18, 0.45);
-    padding: 26px 28px 22px;
+    padding: 26px 28px 20px;
   }
+  .split {
+    display: grid;
+    grid-template-columns: 168px 1fr;
+    gap: 14px 30px;
+    align-items: start;
+  }
+
+  /* left: the book itself */
   .overview {
-    display: flex;
-    gap: 18px;
-    align-items: flex-start;
-    padding-bottom: 18px;
-    border-bottom: 1px solid var(--paper-edge);
+    padding-right: 6px;
   }
   .cover {
-    width: 92px;
-    min-height: 130px;
+    display: block;
+    width: 100%;
+    margin-bottom: 14px;
     object-fit: cover;
     border-radius: 4px;
     box-shadow: 2px 3px 8px rgba(30, 25, 15, 0.3), 1px 0 0 rgba(0, 0, 0, 0.12) inset;
     background: var(--paper-dim);
   }
   .cover.blank {
+    aspect-ratio: 2 / 3;
     display: grid;
     place-items: center;
     background: #efe8d9;
-    border-color: #d8ccb2;
     font-family: var(--font-mono);
     font-size: 11px;
+    letter-spacing: 0.14em;
     color: var(--ink-faint);
     border: 1px solid var(--paper-edge);
     box-shadow: none;
   }
-  .kind {
-    font-size: 10.5px;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--gilt-deep);
-  }
   h2 {
     font-family: var(--font-display);
-    font-size: 24px;
+    font-size: 21px;
     font-weight: 560;
-    line-height: 1.2;
-    margin: 2px 0 2px;
+    line-height: 1.25;
+    margin: 0 0 4px;
   }
-  .author {
-    color: var(--ink-soft);
-    font-size: 13.5px;
-  }
-  .stats {
-    margin-top: 10px;
+  .byline {
     color: var(--ink-soft);
     font-size: 12.5px;
+  }
+  .stats {
+    margin-top: 8px;
+    color: var(--ink-soft);
+    font-size: 12px;
+    line-height: 1.6;
   }
   .warn {
     margin-top: 8px;
     color: var(--gilt-deep);
     font-size: 12px;
   }
-  .mono {
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    color: var(--ink);
-    background: var(--paper-dim);
-    padding: 1px 5px;
-    border-radius: 4px;
-  }
+
+  /* right: the translation job */
   .form {
-    padding-top: 18px;
     display: flex;
     flex-direction: column;
     gap: 16px;
+    padding-top: 2px;
   }
-  .row {
+  .field {
     display: flex;
-    gap: 14px;
-    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
   }
-  .grow {
-    flex: 1;
-  }
-  .rate-hint {
-    font-size: 11px;
-    line-height: 1.5;
-    color: var(--ink-soft);
-    white-space: pre-line;
-  }
-  .row :global(select) {
-    max-width: 250px;
-    width: 100%;
-    min-width: 0;
-  }
-  .row .field.grow {
-    min-width: 0;
-  }
-  .field select {
-    width: 100%;
-  }
+  label,
   .label {
     font-size: 11px;
     font-weight: 700;
@@ -254,69 +249,60 @@
     text-transform: uppercase;
     color: var(--ink-soft);
   }
-
-  /* facing-pages output selector — the signature */
-  .facing {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-  }
-  .face {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    padding: 14px 10px 12px;
-    min-height: 132px;
-    border: 1.5px solid #d5c9ad;
-    border-radius: 8px;
-    background: #fffdf7;
-    transition: border-color 0.12s ease, box-shadow 0.12s ease;
-  }
-  .face:hover {
-    border-color: var(--ink-faint);
-  }
-  .face.on {
-    border-color: var(--gilt);
-    box-shadow: 0 0 0 1px var(--gilt), 0 4px 14px rgba(199, 154, 59, 0.18);
-  }
-  .pg {
-    font-size: 12.5px;
-    line-height: 2;
-    padding: 6px 16px;
-    background: var(--paper-dim);
-    border-radius: 3px 3px 0 0;
-    box-shadow: 0 -1px 0 var(--paper-edge) inset;
-    width: 82%;
-    text-align: center;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-  .pg.b {
-    color: var(--ink-soft);
-    margin-top: 1px;
-    border-radius: 0 0 3px 3px;
-  }
-  .pg.a.only {
-    border-radius: 3px;
-  }
-  .face-name {
-    margin-top: 4px;
-    font-weight: 650;
-    font-size: 13px;
-  }
-  .face-sub {
+  .rate-hint {
     font-size: 11px;
+    line-height: 1.5;
     color: var(--ink-faint);
+    white-space: pre-line;
+  }
+  .estimate {
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--gilt-deep);
   }
 
+  /* output mode: one quiet segmented control */
+  .segmented {
+    display: inline-flex;
+    gap: 3px;
+    padding: 3px;
+    background: var(--paper-dim);
+    border: 1px solid var(--paper-edge);
+    border-radius: 9px;
+    align-self: flex-start;
+  }
+  .segmented button {
+    padding: 7px 18px;
+    border-radius: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    white-space: nowrap;
+    transition: color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+  }
+  .segmented button.on {
+    background: #fffdf7;
+    color: var(--ink);
+    box-shadow: 0 0 0 1px var(--gilt), 0 2px 6px rgba(199, 154, 59, 0.16);
+  }
+
+  /* action bar */
   .actions {
     display: flex;
     align-items: center;
-    gap: 12px;
-    min-height: 38px;
+    gap: 14px;
+    border-top: 1px solid var(--paper-edge);
+    padding-top: 16px;
+    margin-top: 20px;
+  }
+  .btn-group {
+    display: flex;
+    gap: 10px;
+    margin-left: auto;
+  }
+  .hint {
+    font-size: 12.5px;
+    color: var(--ink-soft);
   }
   .linkish {
     color: var(--gilt-deep);
@@ -324,8 +310,17 @@
     font-size: 12px;
   }
   .error {
-    margin-top: 14px;
+    margin-top: 12px;
     color: var(--error);
     font-size: 13px;
+  }
+
+  @media (max-width: 620px) {
+    .split {
+      grid-template-columns: 1fr;
+    }
+    .cover {
+      max-width: 170px;
+    }
   }
 </style>

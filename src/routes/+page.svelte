@@ -7,7 +7,7 @@
   import BookCard from "$lib/components/BookCard.svelte";
   import ProgressCard from "$lib/components/ProgressCard.svelte";
   import SettingsModal from "$lib/components/SettingsModal.svelte";
-  import { app, init, resetBook } from "$lib/stores.svelte";
+  import { app, init } from "$lib/stores.svelte";
 
   onMount(() => {
     void init();
@@ -15,7 +15,7 @@
 </script>
 
 <div id="app">
-  <Header onNewBook={resetBook} />
+  <Header />
   <main>
     {#if app.view === "drop" || !app.book}
       <DropZone onloaded={() => {}} />
@@ -35,7 +35,8 @@
 
 <style>
   main {
-    height: calc(100% - 53px);
+    flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     align-items: center;

@@ -5,6 +5,8 @@
   import { app, resetBook } from "$lib/stores.svelte";
 
   let saving = $state(false);
+  let confirmDiscard = $state(false);
+  let confirmEl: HTMLDivElement | null = $state(null);
 
   const progress = $derived(app.progress);
   const pct = $derived(
@@ -28,7 +30,7 @@
 
   async function saveEpub() {
     if (!app.book) return;
-    const lang = app.jobLang || (app.settings?.targetLang?.split(" (")[0] ?? "translation");
+    const lang = app.jobLang || (app.form?.lang?.split(" (")[0] ?? "translation");
     const safeTitle = app.book.title.replace(/[\\/:*?"<>|]/g, "").trim() || "book";
     const path = await save({
       defaultPath: `${safeTitle} (${lang}).epub`,
@@ -49,6 +51,38 @@
   async function reveal() {
     if (app.savedPath) await revealItemInDir(app.savedPath).catch(() => openPath(app.savedPath));
   }
+
+  // Cancelling out of a finished job must never silently throw away an
+  // unsaved translation.
+  function cancel() {
+    if (done && !app.savedPath) {
+      confirmDiscard = true;
+      return;
+    }
+    resetBook();
+  }
+
+  function keepBook() {
+    confirmDiscard = false;
+  }
+
+  function discardBook() {
+    confirmDiscard = false;
+    resetBook();
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (!confirmDiscard) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      keepBook();
+    }
+  }
+
+  // Move focus onto the dialog when it opens.
+  $effect(() => {
+    if (confirmDiscard) confirmEl?.focus();
+  });
 </script>
 
 {#if progress}
@@ -111,27 +145,58 @@
 
     <footer>
       {#if running}
-        <button class="btn btn-ghost" onclick={() => cancelJob()}>Pause</button>
+        <div class="btn-group">
+          <button class="btn btn-ghost" onclick={() => cancelJob()}>Pause</button>
+        </div>
       {:else if done}
         {#if app.savedPath}
           <p class="saved">Saved to <span class="mono path">{app.savedPath}</span></p>
-          <button class="btn btn-ghost" onclick={reveal}>Show in Finder</button>
+          <div class="btn-group">
+            <button class="btn btn-ghost" onclick={reveal}>Show in Finder</button>
+            <button class="btn btn-ghost" onclick={resetBook}>Done</button>
+          </div>
         {:else}
-          <button class="btn btn-primary" onclick={saveEpub} disabled={saving}>
-            {saving ? "Saving…" : "Save EPUB"}
-          </button>
+          <div class="btn-group">
+            <button class="btn btn-ghost" onclick={cancel}>Cancel</button>
+            <button class="btn btn-primary" onclick={saveEpub} disabled={saving}>
+              {saving ? "Saving…" : "Save book"}
+            </button>
+          </div>
         {/if}
-        <button class="btn btn-ghost" onclick={resetBook}>Another book</button>
       {:else if progress.status === "cancelled" || progress.status === "failed"}
         <p class="hint">Progress is kept on this machine — start again to continue where you left off.</p>
-        <button class="btn btn-primary" onclick={() => (app.view = "ready")}>Back to book</button>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick={() => (app.view = "ready")}>Back to book</button>
+        </div>
       {/if}
       {#if progress.batchesFailed > 0 && done}
         <p class="warn">{progress.batchesFailed} batches failed — their paragraphs stay in the original language.</p>
       {/if}
     </footer>
   </article>
+
+  {#if confirmDiscard}
+    <div class="overlay" role="presentation">
+      <button class="overlay-close" aria-label="Keep the book" onclick={keepBook}></button>
+      <div
+        class="confirm"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="discard-title"
+        tabindex="-1"
+        bind:this={confirmEl}>
+        <h3 id="discard-title">Unsaved translation</h3>
+        <p>“{app.book?.title}” hasn't been saved yet — discard the translated book?</p>
+        <footer>
+          <button class="btn btn-ghost" onclick={keepBook}>Keep book</button>
+          <button class="btn btn-danger" onclick={discardBook}>Discard</button>
+        </footer>
+      </div>
+    </div>
+  {/if}
 {/if}
+
+<svelte:window onkeydown={onKeydown} />
 
 <style>
   .card {
@@ -304,6 +369,12 @@
     border-top: 1px solid var(--paper-edge);
     padding-top: 14px;
   }
+  .btn-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: auto;
+  }
   .saved {
     font-size: 12.5px;
     color: var(--ink-soft);
@@ -327,5 +398,57 @@
     width: 100%;
     font-size: 12px;
     color: var(--gilt-deep);
+  }
+
+  /* in-app discard confirmation */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(10, 16, 22, 0.62);
+    display: grid;
+    place-items: center;
+  }
+  .overlay-close {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    cursor: default;
+  }
+  .confirm {
+    position: relative;
+    width: min(380px, 92vw);
+    background: var(--paper);
+    border-radius: var(--radius);
+    box-shadow: 0 24px 60px rgba(4, 8, 12, 0.55);
+    padding: 20px 22px 16px;
+    outline: none;
+  }
+  .confirm h3 {
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 560;
+    margin-bottom: 6px;
+  }
+  .confirm p {
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+  .confirm footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--paper-edge);
+  }
+  .btn-danger {
+    color: var(--error);
+    border: 1px solid var(--paper-edge);
+    background: transparent;
+  }
+  .btn-danger:hover {
+    border-color: var(--error);
+    background: #f5e7e2;
   }
 </style>

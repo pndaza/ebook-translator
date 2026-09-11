@@ -179,3 +179,26 @@ pub fn get_current_book(state: State<'_, AppState>) -> Option<BookInfo> {
 pub fn get_job_progress(state: State<'_, AppState>) -> Option<crate::types::JobProgress> {
     state.progress.lock().unwrap().clone()
 }
+
+/// Exact number of API requests the loaded book needs with the given model,
+/// computed with the same batching the job will run.
+#[tauri::command]
+pub async fn estimate_requests(state: State<'_, AppState>, model: String) -> Result<usize> {
+    let book = state
+        .book
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| AppError::msg("load a book first"))?;
+    let n = tauri::async_runtime::spawn_blocking(move || {
+        let book = book.lock().unwrap();
+        let docs = match &book.source {
+            crate::types::BookSource::Epub { docs, .. }
+            | crate::types::BookSource::Pdf { docs, .. } => docs,
+        };
+        crate::job::build_batches(docs, &model).len()
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("estimate task failed: {e}")))?;
+    Ok(n)
+}

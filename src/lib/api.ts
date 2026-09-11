@@ -8,7 +8,6 @@ const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
 export interface Settings {
   apiKey: string;
   model: string;
-  targetLang: string;
   mode: string;
   customInstructions: string;
 }
@@ -77,8 +76,7 @@ export const getSettings = () =>
     : Promise.resolve({
         apiKey: "AIza-browser-preview-key",
         model: "gemini-3.5-flash-lite",
-        targetLang: "Burmese (မြန်မာ)",
-        mode: "bilingual",
+        mode: "translated",
         customInstructions: "",
       } as Settings);
 
@@ -202,6 +200,14 @@ export const getCurrentBook = (): Promise<BookInfo | null> =>
 export const getJobProgress = (): Promise<JobProgress | null> =>
   inTauri ? invoke<JobProgress | null>("get_job_progress") : Promise.resolve(null);
 
+export const estimateRequests = (model: string): Promise<number | null> => {
+  if (inTauri) return invoke<number | null>("estimate_requests", { model });
+  // Browser preview: approximate with the calibrated token estimator.
+  const budget = model.includes("lite") ? 5_000 : 10_000;
+  const tokens = Math.ceil(fixtureBook.totalChars / 2.3);
+  return Promise.resolve(Math.max(1, Math.ceil(tokens / budget)));
+};
+
 export function onJobProgress(cb: ProgressCb): Promise<UnlistenFn> {
   if (inTauri) return listen<JobProgress>("job-progress", (e) => cb(e.payload));
   previewProgressCb = cb;
@@ -218,24 +224,7 @@ export function onJobLog(cb: (msg: string) => void): Promise<UnlistenFn> {
   });
 }
 
-export const LANGUAGES = [
-  "Burmese (မြန်မာ)",
-  "English",
-  "Thai",
-  "Chinese (Simplified)",
-  "Chinese (Traditional)",
-  "Japanese",
-  "Korean",
-  "Vietnamese",
-  "Indonesian",
-  "Hindi",
-  "French",
-  "German",
-  "Spanish",
-  "Portuguese",
-  "Russian",
-  "Arabic",
-];
+export const LANGUAGES = ["Burmese (မြန်မာ)", "English"];
 
 export const MODELS = [
   { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite" },
@@ -246,7 +235,7 @@ export const MODELS = [
 ];
 
 /// Free-tier rate limits shown under the model picker.
-export const MODEL_RATE_HINT = "20 requests for flash.\n500 requests for flash lite.";
+export const MODEL_RATE_HINT = "20 requests for flash, 500 requests for flash lite.";
 
 export function formatChars(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M chars`;

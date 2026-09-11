@@ -1,12 +1,5 @@
 <script lang="ts">
   import { app } from "$lib/stores.svelte";
-
-  let { onNewBook }: { onNewBook?: () => void } = $props();
-
-  // A finished job keeps view "running"; only hide the button while work is in flight.
-  const busy = $derived(
-    app.view === "running" && (app.progress == null || app.progress.status === "running"),
-  );
 </script>
 
 <header>
@@ -15,9 +8,6 @@
     <h1>Ebook Translator</h1>
   </div>
   <nav>
-    {#if app.book && !busy}
-      <button class="chrome-btn" onclick={() => onNewBook?.()}>Another book</button>
-    {/if}
     <button
       class="chrome-btn"
       onclick={() => (app.settingsOpen = true)}
