@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 // In a plain browser (pnpm dev without Tauri) fall back to fixture data so
 // the UI can be developed and reviewed outside the desktop shell.
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export const isDesktopApp = inTauri;
 
 export interface Settings {
   apiKey: string;

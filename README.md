@@ -55,3 +55,16 @@ src-tauri/src/
 
 `pnpm dev` serves the UI standalone with fixture data (no Tauri, no API) — useful for
 working on components in a normal browser.
+
+## Releases & self-update (macOS)
+
+`git push` a `v*` tag (matching the version in `src-tauri/tauri.conf.json`) to run the
+release workflow: it builds a universal (Apple Silicon + Intel) app and attaches the
+DMG plus updater artifacts to a draft GitHub release — review and publish it. The app
+then offers **Settings → App updates → Check for updates** and installs signed
+updates from the published `latest.json`.
+
+- Update signing uses the minisign keypair at `~/.tauri/ebook-translator.key`; the
+  private key lives only in the `TAURI_SIGNING_PRIVATE_KEY` repo secret (never in git)
+- Local `tauri build` bundles need those env vars set; `tauri dev` and `pnpm build`
+  do not

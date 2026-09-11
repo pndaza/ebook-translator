@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { saveSettings, testApiKey, MODELS, MODEL_RATE_HINT } from "$lib/api";
+  import { saveSettings, testApiKey, MODELS, MODEL_RATE_HINT, isDesktopApp } from "$lib/api";
   import { app } from "$lib/stores.svelte";
+  import UpdaterSection from "$lib/components/UpdaterSection.svelte";
 
   let apiKey = $state("");
   let model = $state("");
@@ -139,6 +140,10 @@
           placeholder="e.g. Use formal register. Keep Pāli terms like “nibbāna” untranslated."></textarea>
         <p class="note">Appended to every request — glossary rules, tone, terms to keep as-is.</p>
       </div>
+
+      {#if isDesktopApp}
+        <UpdaterSection />
+      {/if}
 
       <footer>
         <button class="btn btn-primary" onclick={saveAll} disabled={savingState}>
