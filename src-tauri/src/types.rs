@@ -12,6 +12,8 @@ pub struct BookInfo {
     pub cover_data_url: Option<String>,
     pub total_chars: usize,
     pub segments: Vec<SegmentInfo>,
+    /// Non-fatal problems seen while parsing (e.g. missing spine entries).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,7 +58,7 @@ pub struct SegmentStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobProgress {
-    pub status: String, // running | completed | cancelled | failed
+    pub status: String, // running | completed | partial | cancelled | failed
     pub segments: Vec<SegmentStatus>,
     pub batches_total: usize,
     pub batches_done: usize,
@@ -78,6 +80,9 @@ pub struct Block {
     /// Original tag name (p, li, td, ...), used to pick the sibling tag for
     /// bilingual insertion so lists and tables stay valid.
     pub tag: String,
+    /// Part translations of an oversized block (see `job::split_oversized`);
+    /// emptied again once every part has arrived and `translation` is set.
+    pub parts: Vec<Option<String>>,
 }
 
 /// One content document (a spine XHTML file for EPUB, a generated chapter for PDF).

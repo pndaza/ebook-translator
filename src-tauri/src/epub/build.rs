@@ -15,12 +15,16 @@ fn deflated_opts() -> SimpleFileOptions {
 
 /// Rebuild the original EPUB, swapping in rewritten content documents.
 /// The `mimetype` entry is always written first and stored uncompressed.
+/// Replacement keys are decoded OPF paths; archive entry names may legally
+/// be stored percent-encoded, so matching goes through `entry_key`.
+/// Returns the bytes plus how many replacements matched no entry.
 pub fn repack(
     original: &[u8],
     replacements: &HashMap<String, String>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, usize)> {
     let mut reader = zip::ZipArchive::new(Cursor::new(original))?;
     let mut out = Vec::new();
+    let mut applied = 0usize;
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut out));
         writer.start_file("mimetype", stored_opts())?;
@@ -29,20 +33,28 @@ pub fn repack(
         let mut names: Vec<String> = reader.file_names().map(str::to_string).collect();
         names.retain(|n| n != "mimetype");
         for name in names {
-            let content: Vec<u8> = if let Some(html) = replacements.get(name.as_str()) {
-                html.clone().into_bytes()
-            } else {
-                let mut f = reader.by_name(&name)?;
-                let mut buf = Vec::with_capacity(f.size() as usize);
-                f.read_to_end(&mut buf)?;
-                buf
+            let key = crate::epub::entry_key(&name);
+            let content: Vec<u8> = match replacements
+                .get(name.as_str())
+                .or_else(|| replacements.get(&key))
+            {
+                Some(html) => {
+                    applied += 1;
+                    html.clone().into_bytes()
+                }
+                None => {
+                    let mut f = reader.by_name(&name)?;
+                    let mut buf = Vec::with_capacity(f.size() as usize);
+                    f.read_to_end(&mut buf)?;
+                    buf
+                }
             };
             writer.start_file(name.as_str(), deflated_opts())?;
             writer.write_all(&content)?;
         }
         writer.finish()?;
     }
-    Ok(out)
+    Ok((out, replacements.len().saturating_sub(applied)))
 }
 
 fn xml_escape(s: &str) -> String {

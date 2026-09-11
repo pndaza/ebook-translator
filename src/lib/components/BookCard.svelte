@@ -9,12 +9,21 @@
   let model = $state("gemini-3.5-flash-lite");
   let starting = $state(false);
 
+  // Seed once: carry over choices from a previous visit of this form if any,
+  // otherwise fall back to the saved defaults. The $effect below syncs the
+  // store as the user edits (and on first mount), so "Back to book" keeps
+  // their language — and the language-keyed resume cache stays valid.
+  if (app.form) {
+    lang = app.form.lang;
+    mode = app.form.mode;
+    model = app.form.model;
+  } else {
+    lang = app.settings?.targetLang || LANGUAGES[0];
+    mode = app.settings?.mode || "bilingual";
+    model = app.settings?.model || "gemini-3.5-flash-lite";
+  }
   $effect(() => {
-    if (app.settings) {
-      lang = app.settings.targetLang || LANGUAGES[0];
-      mode = app.settings.mode || "bilingual";
-      model = app.settings.model || "gemini-3.5-flash-lite";
-    }
+    app.form = { lang, mode, model };
   });
 
   async function begin() {
@@ -28,8 +37,12 @@
         model,
         customInstructions: app.settings?.customInstructions ?? "",
       });
-      app.view = "running";
+      // Drop the previous run's card so the new one starts clean.
+      app.progress = null;
+      app.logs = [];
       app.savedPath = "";
+      app.jobLang = lang;
+      app.view = "running";
       onstart();
     } catch (e) {
       app.error = String(e);
@@ -60,6 +73,11 @@
           <span class="mono">{formatChars(book.totalChars)}</span> ·
           <span class="mono">{book.segments.reduce((n, s) => n + s.blocks, 0)}</span> paragraphs
         </p>
+        {#if book.warnings.length}
+          <p class="warn" role="alert">
+            {#each book.warnings as w}{w} {/each}
+          </p>
+        {/if}
       </div>
     </div>
 
@@ -184,6 +202,11 @@
     margin-top: 10px;
     color: var(--ink-soft);
     font-size: 12.5px;
+  }
+  .warn {
+    margin-top: 8px;
+    color: var(--gilt-deep);
+    font-size: 12px;
   }
   .mono {
     font-family: var(--font-mono);

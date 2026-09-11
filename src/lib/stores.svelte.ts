@@ -1,4 +1,6 @@
 import {
+  getCurrentBook,
+  getJobProgress,
   getSettings,
   onJobLog,
   onJobProgress,
@@ -19,6 +21,12 @@ export const app = $state({
   settingsOpen: false,
   settings: null as Settings | null,
   savedPath: "" as string,
+  // Translate-form choices, kept in the store so they survive leaving the
+  // ready view (Back to book / settings save) instead of resetting to
+  // defaults — which would silently break the language-keyed resume cache.
+  form: null as null | { lang: string; mode: string; model: string },
+  // Language the current job runs with, used for the output filename.
+  jobLang: "" as string,
 });
 
 export async function init() {
@@ -34,6 +42,20 @@ export async function init() {
   await onJobLog((msg) => {
     app.logs = [...app.logs.slice(-40), msg];
   });
+  // After a webview reload the backend may still hold a book and a job.
+  try {
+    const [book, progress] = await Promise.all([getCurrentBook(), getJobProgress()]);
+    if (progress) {
+      app.progress = progress;
+      if (book) app.book = book;
+      app.view = "running";
+    } else if (book && !app.book) {
+      app.book = book;
+      app.view = "ready";
+    }
+  } catch {
+    // Desktop-only restore; ignore in the browser preview.
+  }
 }
 
 export function resetBook() {
@@ -43,4 +65,5 @@ export function resetBook() {
   app.logs = [];
   app.savedPath = "";
   app.error = "";
+  app.form = null;
 }

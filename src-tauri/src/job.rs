@@ -23,8 +23,18 @@ const CONCURRENCY: usize = 3;
 const MAX_BATCH_BLOCKS: usize = 100;
 
 #[derive(Clone)]
+pub struct BatchItem {
+    pub d: usize, // doc index
+    pub b: usize, // block index
+    /// (part index, part count) when an oversized block was split.
+    pub part: Option<(usize, usize)>,
+    /// Exact text sent to the model (whole block, or one part of it).
+    pub text: String,
+}
+
+#[derive(Clone)]
 pub struct Batch {
-    pub items: Vec<(usize, usize)>, // (doc index, block index)
+    pub items: Vec<BatchItem>,
     pub chars: usize,
     pub tokens: usize, // estimated input tokens, used for budgeting
 }
@@ -35,6 +45,41 @@ fn docs_of(book: &LoadedBook) -> &Vec<ContentDoc> {
     }
 }
 
+/// Split a block whose token estimate alone busts the request budget into
+/// whitespace-bounded parts. Concatenating the parts restores the original
+/// text exactly, so the joined translation can replace it wholesale.
+pub fn split_oversized(text: &str, budget: usize) -> Vec<String> {
+    let target = (budget / 2).max(200);
+    let mut parts: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let mut ascii = 0usize;
+    let mut other = 0usize;
+    let mut hard_run = 0usize;
+    for (i, c) in text.char_indices() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+        hard_run += 1;
+        let at_target = crate::gemini::estimate_counts(ascii, other) >= target;
+        // Prefer cutting after whitespace; force a cut if a single run of
+        // non-whitespace blows past the target by a wide margin.
+        if at_target && (c.is_whitespace() || hard_run >= target * 4) {
+            let end = i + c.len_utf8();
+            parts.push(text[start..end].to_string());
+            start = end;
+            ascii = 0;
+            other = 0;
+            hard_run = 0;
+        }
+    }
+    if start < text.len() {
+        parts.push(text[start..].to_string());
+    }
+    parts
+}
+
 pub fn build_batches(docs: &[ContentDoc], model: &str) -> Vec<Batch> {
     let budget = crate::gemini::batch_token_budget(model);
     let mut batches: Vec<Batch> = Vec::new();
@@ -43,17 +88,9 @@ pub fn build_batches(docs: &[ContentDoc], model: &str) -> Vec<Batch> {
         chars: 0,
         tokens: 0,
     };
-    for (d, doc) in docs.iter().enumerate() {
-        for (b, block) in doc.blocks.iter().enumerate() {
-            if block.skipped {
-                continue;
-            }
-            let chars = block.text.chars().count();
-            let tokens = crate::gemini::estimate_tokens(&block.text);
-            if !current.items.is_empty()
-                && (current.tokens + tokens > budget
-                    || current.items.len() >= MAX_BATCH_BLOCKS)
-            {
+    macro_rules! flush {
+        () => {
+            if !current.items.is_empty() {
                 batches.push(std::mem::replace(
                     &mut current,
                     Batch {
@@ -63,35 +100,94 @@ pub fn build_batches(docs: &[ContentDoc], model: &str) -> Vec<Batch> {
                     },
                 ));
             }
-            current.items.push((d, b));
-            current.chars += chars;
-            current.tokens += tokens;
+        };
+    }
+    for (d, doc) in docs.iter().enumerate() {
+        for (b, block) in doc.blocks.iter().enumerate() {
+            if block.skipped {
+                continue;
+            }
+            let tokens = crate::gemini::estimate_tokens(&block.text);
+            let pieces: Vec<(Option<(usize, usize)>, String)> = if tokens > budget {
+                let parts = split_oversized(&block.text, budget);
+                let n = parts.len();
+                parts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(pi, t)| (Some((pi, n)), t))
+                    .collect()
+            } else {
+                vec![(None, block.text.clone())]
+            };
+            for (part, text) in pieces {
+                let chars = text.chars().count();
+                let tokens = crate::gemini::estimate_tokens(&text);
+                if !current.items.is_empty()
+                    && (current.tokens + tokens > budget
+                        || current.items.len() >= MAX_BATCH_BLOCKS)
+                {
+                    flush!();
+                }
+                current.items.push(BatchItem {
+                    d,
+                    b,
+                    part,
+                    text: text.to_string(),
+                });
+                current.chars += chars;
+                current.tokens += tokens;
+            }
         }
     }
-    if !current.items.is_empty() {
-        batches.push(current);
-    }
+    flush!();
     batches
+}
+
+/// Store one translated piece, joining split blocks once all parts arrived.
+fn apply_translation(docs: &mut [ContentDoc], item: &BatchItem, t: &str) {
+    let block = &mut docs[item.d].blocks[item.b];
+    match item.part {
+        None => block.translation = Some(t.to_string()),
+        Some((pi, total)) => {
+            if block.parts.len() != total {
+                block.parts.clear();
+                block.parts.resize(total, None);
+            }
+            block.parts[pi] = Some(t.to_string());
+            if block.parts.iter().all(Option::is_some) {
+                let joined: String =
+                    block.parts.iter().flatten().map(String::as_str).collect();
+                block.translation = Some(joined);
+                block.parts.clear();
+            }
+        }
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn resume_key(book: &LoadedBook, model: &str, lang: &str) -> String {
+/// Identity of a translation run for resume caching. Custom instructions are
+/// part of the translation function — changing them must invalidate the cache,
+/// or stale translations would be silently replayed.
+pub fn resume_key(book: &LoadedBook, model: &str, lang: &str, instructions: &str) -> String {
     let bytes = match &book.source {
         BookSource::Epub { bytes, .. } => bytes,
         BookSource::Pdf { bytes, .. } => bytes,
     };
     let mut h = Sha256::new();
     h.update(bytes);
+    let mut ih = Sha256::new();
+    ih.update(instructions.trim().as_bytes());
     format!(
-        "{}-{}-{}-{}-{}",
+        "{}-{}-{}-{}-{}-{}",
         to_hex(&h.finalize()),
         model,
         lang,
         crate::gemini::batch_token_budget(model),
-        MAX_BATCH_BLOCKS
+        MAX_BATCH_BLOCKS,
+        &to_hex(&ih.finalize())[..8]
     )
 }
 
@@ -139,6 +235,8 @@ struct ProgressCtx {
     failed: Mutex<usize>,
     chars_done: Mutex<usize>,
     tokens: AtomicU64,
+    /// Latest snapshot, readable from the UI at any time (`get_job_progress`).
+    snapshot_slot: Arc<Mutex<Option<JobProgress>>>,
 }
 
 impl ProgressCtx {
@@ -184,7 +282,9 @@ impl ProgressCtx {
     }
 
     fn emit(&self, status: &str, error: Option<String>, output_ready: bool) {
-        let _ = self.app.emit(EVENT_PROGRESS, self.snapshot(status, error, output_ready));
+        let snap = self.snapshot(status, error, output_ready);
+        *self.snapshot_slot.lock().unwrap() = Some(snap.clone());
+        let _ = self.app.emit(EVENT_PROGRESS, snap);
     }
 
     fn log(&self, msg: impl Into<String>) {
@@ -204,25 +304,47 @@ pub async fn run(
     cancel: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     output: Arc<Mutex<Option<Vec<u8>>>>,
+    snapshot_slot: Arc<Mutex<Option<JobProgress>>>,
 ) {
-    let res = run_inner(&app, &book, &opts, &api_key, &data_dir, &cancel, &output).await;
+    // Set once run_inner builds its ProgressCtx, so a late failure can emit
+    // the real counters instead of a zeroed snapshot.
+    let ctx_slot: Arc<Mutex<Option<Arc<ProgressCtx>>>> = Arc::new(Mutex::new(None));
+    let res = run_inner(
+        &app,
+        &book,
+        &opts,
+        &api_key,
+        &data_dir,
+        &cancel,
+        &output,
+        &snapshot_slot,
+        &ctx_slot,
+    )
+    .await;
     running.store(false, Ordering::SeqCst);
     if let Err(e) = res {
-        let ctx = ProgressCtx {
-            app: app.clone(),
-            book: book.clone(),
-            batches_total: 0,
-            chars_total: book.lock().unwrap().info.total_chars,
-            done: Mutex::new(0),
-            failed: Mutex::new(0),
-            chars_done: Mutex::new(0),
-            tokens: AtomicU64::new(0),
-        };
-        ctx.log(format!("Job failed: {e}"));
-        ctx.emit("failed", Some(e.to_string()), false);
+        if let Some(ctx) = ctx_slot.lock().unwrap().as_ref() {
+            ctx.log(format!("Job failed: {e}"));
+            ctx.emit("failed", Some(e.to_string()), false);
+        } else {
+            let ctx = ProgressCtx {
+                app: app.clone(),
+                book: book.clone(),
+                batches_total: 0,
+                chars_total: book.lock().unwrap().info.total_chars,
+                done: Mutex::new(0),
+                failed: Mutex::new(0),
+                chars_done: Mutex::new(0),
+                tokens: AtomicU64::new(0),
+                snapshot_slot,
+            };
+            ctx.log(format!("Job failed: {e}"));
+            ctx.emit("failed", Some(e.to_string()), false);
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     app: &tauri::AppHandle,
     book_ref: &Arc<Mutex<LoadedBook>>,
@@ -231,8 +353,15 @@ async fn run_inner(
     data_dir: &std::path::Path,
     cancel: &Arc<AtomicBool>,
     output: &Arc<Mutex<Option<Vec<u8>>>>,
+    snapshot_slot: &Arc<Mutex<Option<JobProgress>>>,
+    ctx_slot: &Arc<Mutex<Option<Arc<ProgressCtx>>>>,
 ) -> Result<()> {
-    let key = resume_key(&book_ref.lock().unwrap(), &opts.model, &opts.target_lang);
+    let key = resume_key(
+        &book_ref.lock().unwrap(),
+        &opts.model,
+        &opts.target_lang,
+        &opts.custom_instructions,
+    );
     let log_path = data_dir.join("jobs").join(format!("{key}.jsonl"));
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -244,14 +373,14 @@ async fn run_inner(
     let resumed = load_resume(&log_path);
     {
         let mut book = book_ref.lock().unwrap();
+        let docs = match &mut book.source {
+            BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
+        };
         for (bi, batch) in batches.iter().enumerate() {
             if let Some(tr) = resumed.get(&bi) {
-                let docs = match &mut book.source {
-                    BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
-                };
-                for (k, (d, b)) in batch.items.iter().enumerate() {
+                for (k, item) in batch.items.iter().enumerate() {
                     if let Some(t) = tr.get(&(k + 1)) {
-                        docs[*d].blocks[*b].translation = Some(t.clone());
+                        apply_translation(docs, item, t);
                     }
                 }
             }
@@ -282,7 +411,9 @@ async fn run_inner(
         failed: Mutex::new(0),
         chars_done: Mutex::new(chars_start),
         tokens: AtomicU64::new(0),
+        snapshot_slot: snapshot_slot.clone(),
     });
+    *ctx_slot.lock().unwrap() = Some(ctx.clone());
 
     if pending.is_empty() && !resumed.is_empty() {
         ctx.log("All batches already translated — resuming from cache.");
@@ -333,7 +464,11 @@ async fn run_inner(
         drop(tx);
         let _ = dispatcher.await;
         for w in workers {
-            let _ = w.await;
+            // A panicked worker (debug builds; release aborts) must not be
+            // silently ignored — its batches would never be translated.
+            if w.await.is_err() {
+                *fatal.lock().unwrap() = Some("a worker task crashed".into());
+            }
         }
     }
 
@@ -349,9 +484,17 @@ async fn run_inner(
         return Ok(());
     }
 
+    let failed = *ctx.failed.lock().unwrap();
+    if ctx.batches_total > 0 && failed >= ctx.batches_total {
+        let msg = "every batch failed after retries".to_string();
+        ctx.log(format!("Stopping: {msg} — nothing was translated."));
+        ctx.emit("failed", Some(msg), false);
+        return Ok(());
+    }
+
     // Assemble the output EPUB.
     let mode = opts.mode.clone();
-    let assembled: Result<Vec<u8>> = {
+    let assembled: Result<(Vec<u8>, usize)> = {
         let book = book_ref.lock().unwrap();
         match &book.source {
             BookSource::Epub { bytes, docs } => {
@@ -371,15 +514,30 @@ async fn run_inner(
                 &opts.target_lang,
                 docs,
                 &mode,
-            ),
+            )
+            .map(|bytes| (bytes, 0)),
         }
     };
 
     match assembled {
-        Ok(bytes) => {
+        Ok((bytes, missed)) => {
+            if missed > 0 {
+                ctx.log(format!(
+                    "Warning: {missed} rewritten document(s) matched no archive entry — their originals were kept."
+                ));
+            }
             *output.lock().unwrap() = Some(bytes);
-            ctx.log("Translation complete.");
-            ctx.emit("completed", None, true);
+            if failed > 0 {
+                ctx.log(format!(
+                    "{failed} of {} batches failed after retries — those paragraphs stay in the original language.",
+                    ctx.batches_total
+                ));
+                ctx.log("Translation finished with gaps.");
+                ctx.emit("partial", None, true);
+            } else {
+                ctx.log("Translation complete.");
+                ctx.emit("completed", None, true);
+            }
             Ok(())
         }
         Err(e) => {
@@ -417,17 +575,12 @@ async fn worker_loop(
 
         limiter.acquire().await;
 
-        let paras: Vec<(usize, String)> = {
-            let book = book_ref.lock().unwrap();
-            batches[bi]
-                .items
-                .iter()
-                .enumerate()
-                .map(|(k, (d, b))| {
-                    (k + 1, docs_of(&book)[*d].blocks[*b].text.clone())
-                })
-                .collect()
-        };
+        let paras: Vec<(usize, String)> = batches[bi]
+            .items
+            .iter()
+            .enumerate()
+            .map(|(k, item)| (k + 1, item.text.clone()))
+            .collect();
         let chars = batches[bi].chars;
 
         match client
@@ -440,13 +593,14 @@ async fn worker_loop(
                     let docs = match &mut book.source {
                         BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
                     };
-                    for (k, (d, b)) in batches[bi].items.iter().enumerate() {
+                    for (k, item) in batches[bi].items.iter().enumerate() {
                         if let Some(t) = res.translations.get(&(k + 1)) {
-                            docs[*d].blocks[*b].translation = Some(t.clone());
+                            apply_translation(docs, item, t);
                         }
                     }
                 }
                 append_resume(&mut resume_writer.lock().unwrap(), bi, &res.translations);
+                limiter.note_success();
                 ctx.tokens.fetch_add(res.total_tokens, Ordering::Relaxed);
                 *ctx.chars_done.lock().unwrap() += chars;
                 *ctx.done.lock().unwrap() += 1;
@@ -482,6 +636,7 @@ mod tests {
                     skipped: !crate::types::is_translatable(t),
                     translation: None,
                     tag: "p".into(),
+                    parts: Vec::new(),
                 })
                 .collect(),
         }
@@ -515,5 +670,85 @@ mod tests {
         let batches = build_batches(&docs, "gemini-3.5-flash-lite");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].items.len(), 2); // "ok" and "another one"
+    }
+
+    #[test]
+    fn splits_oversized_block_into_budgeted_parts() {
+        // ~26k ascii chars ≈ 6.5k tokens: over the 5k flash-lite budget alone.
+        let huge = "word ".repeat(5_200);
+        let docs = vec![doc("a", &["small one", &huge])];
+        let batches = build_batches(&docs, "gemini-3.5-flash-lite");
+        assert!(batches.len() >= 2, "oversized block must span batches");
+        let mut part_items = 0;
+        for b in &batches {
+            assert!(b.tokens <= 5_000 + 200, "batch over budget: {}", b.tokens);
+            for item in &b.items {
+                if item.part.is_some() {
+                    part_items += 1;
+                    assert_eq!((item.d, item.b), (0, 1));
+                }
+            }
+        }
+        assert!(part_items >= 2);
+
+        // Parts must reassemble into the exact original text.
+        let mut joined = String::new();
+        for b in &batches {
+            for item in &b.items {
+                if item.part.is_some() {
+                    joined.push_str(&item.text);
+                }
+            }
+        }
+        assert_eq!(joined, huge);
+
+        // apply_translation only sets the joined result once all parts land.
+        let mut docs = docs;
+        let all_items: Vec<BatchItem> = batches
+            .iter()
+            .flat_map(|b| b.items.iter().filter(|i| i.part.is_some()).cloned())
+            .collect();
+        for (k, item) in all_items.iter().enumerate() {
+            apply_translation(&mut docs, item, &format!("[T{k}] "));
+            if k + 1 < all_items.len() {
+                assert!(docs[0].blocks[1].translation.is_none());
+            }
+        }
+        let expected: String = (0..all_items.len())
+            .map(|k| format!("[T{k}] "))
+            .collect();
+        assert_eq!(docs[0].blocks[1].translation.as_deref(), Some(expected.as_str()));
+        assert!(docs[0].blocks[1].parts.is_empty());
+    }
+
+    #[test]
+    fn resume_key_reflects_instructions() {
+        let book = LoadedBook {
+            info: crate::types::BookInfo {
+                format: "epub".into(),
+                file_path: "/tmp/x.epub".into(),
+                file_name: "x.epub".into(),
+                title: "x".into(),
+                author: String::new(),
+                cover_data_url: None,
+                total_chars: 0,
+                segments: Vec::new(),
+                warnings: Vec::new(),
+            },
+            source: BookSource::Epub {
+                bytes: b"same bytes".to_vec(),
+                docs: Vec::new(),
+            },
+        };
+        let base = resume_key(&book, "gemini-3.5-flash-lite", "Burmese", "");
+        assert_eq!(base, resume_key(&book, "gemini-3.5-flash-lite", "Burmese", "  "));
+        assert_ne!(
+            base,
+            resume_key(&book, "gemini-3.5-flash-lite", "Burmese", "formal tone")
+        );
+        assert_ne!(
+            base,
+            resume_key(&book, "gemini-3.5-flash", "Burmese", "")
+        );
     }
 }

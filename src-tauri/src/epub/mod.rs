@@ -29,17 +29,13 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve an OPF-relative href to a zip entry path.
-fn normalize_path(base_dir: &str, href: &str) -> String {
-    let path = href.split('#').next().unwrap_or(href);
-    let decoded = percent_decode(path);
-    let joined = if decoded.starts_with('/') || base_dir.is_empty() {
-        decoded.trim_start_matches('/').to_string()
-    } else {
-        format!("{base_dir}/{decoded}")
-    };
+/// Canonical lookup key for a zip entry path: percent-decoded segments,
+/// with `.`/`..`/empty segments resolved. OPF hrefs normalize to this form,
+/// so entry names stored percent-encoded decode to the same key.
+pub(crate) fn entry_key(name: &str) -> String {
+    let decoded = percent_decode(name);
     let mut parts: Vec<&str> = Vec::new();
-    for seg in joined.split('/') {
+    for seg in decoded.split('/') {
         match seg {
             "" | "." => {}
             ".." => {
@@ -49,6 +45,18 @@ fn normalize_path(base_dir: &str, href: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Resolve an OPF-relative href to a zip entry path.
+fn normalize_path(base_dir: &str, href: &str) -> String {
+    let path = href.split('#').next().unwrap_or(href);
+    let decoded = percent_decode(path);
+    let joined = if decoded.starts_with('/') || base_dir.is_empty() {
+        decoded.trim_start_matches('/').to_string()
+    } else {
+        format!("{base_dir}/{decoded}")
+    };
+    entry_key(&joined)
 }
 
 fn dir_of(path: &str) -> String {
@@ -63,6 +71,32 @@ fn read_entry(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<Ve
     let mut buf = Vec::with_capacity(f.size() as usize);
     f.read_to_end(&mut buf).ok()?;
     Some(buf)
+}
+
+/// Read an entry under its decoded path, falling back to the
+/// percent-encoded spelling some toolchains store in the archive.
+fn read_entry_flexible(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
+    if let Some(v) = read_entry(zip, name) {
+        return Some(v);
+    }
+    let encoded = percent_encode_name(name);
+    if encoded != name {
+        return read_entry(zip, &encoded);
+    }
+    None
+}
+
+fn percent_encode_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 pub fn is_epub(bytes: &[u8]) -> bool {
@@ -90,7 +124,7 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
         .find_map(|n| n.attribute("full-path").map(str::to_string))
         .ok_or_else(|| AppError::msg("container.xml has no rootfile"))?;
 
-    let opf_raw = read_entry(&mut zip, &opf_path)
+    let opf_raw = read_entry_flexible(&mut zip, &opf_path)
         .ok_or_else(|| AppError::msg(format!("OPF not found in archive: {opf_path}")))?;
     let opf = String::from_utf8_lossy(&opf_raw);
     let doc = roxmltree::Document::parse(&opf)?;
@@ -144,7 +178,7 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
         .find(|i| i.properties.split_whitespace().any(|p| p == "nav"))
         .map(|i| normalize_path(&opf_dir, &i.href));
     if let Some(nav_path) = &nav_href {
-        if let Some(raw) = read_entry(&mut zip, nav_path) {
+        if let Some(raw) = read_entry_flexible(&mut zip, nav_path) {
             let nav = String::from_utf8_lossy(&raw);
             if let Ok(nd) = roxmltree::Document::parse(&nav) {
                 for a in nd.descendants().filter(|n| n.tag_name().name() == "a") {
@@ -173,7 +207,7 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
         .and_then(|id| manifest.get(id))
         .map(|i| normalize_path(&opf_dir, &i.href));
     if let Some(ncx_path) = &ncx_href {
-        if let Some(raw) = read_entry(&mut zip, ncx_path) {
+        if let Some(raw) = read_entry_flexible(&mut zip, ncx_path) {
             let ncx = String::from_utf8_lossy(&raw);
             if let Ok(nd) = roxmltree::Document::parse(&ncx) {
                 for np in nd.descendants().filter(|n| n.tag_name().name() == "navPoint") {
@@ -218,7 +252,7 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
         });
     let cover_data_url = cover_path
         .as_deref()
-        .and_then(|p| read_entry(&mut zip, p))
+        .and_then(|p| read_entry_flexible(&mut zip, p))
         .map(|img| {
             let mime = cover_path
                 .as_deref()
@@ -237,9 +271,15 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
 
     // parse spine content documents
     let mut docs: Vec<ContentDoc> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut total_chars = 0usize;
     for path in &spine_paths {
-        let Some(raw) = read_entry(&mut zip, path) else { continue };
+        let Some(raw) = read_entry_flexible(&mut zip, path) else {
+            warnings.push(format!(
+                "Section “{path}” is missing from the archive and was skipped."
+            ));
+            continue;
+        };
         let content = String::from_utf8_lossy(&raw).into_owned();
         let blocks = html::collect_blocks(&content);
         let has_content = blocks.iter().any(|b| !b.skipped);
@@ -292,10 +332,11 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
                     .blocks
                     .iter()
                     .filter(|b| !b.skipped)
-                    .map(|b| b.text.chars().count())
-                    .sum(),
+                .map(|b| b.text.chars().count())
+                .sum(),
             })
             .collect(),
+        warnings,
     };
 
     Ok(LoadedBook {
@@ -424,7 +465,7 @@ mod tests {
                 replacements.insert(doc.path.clone(), rewritten);
             }
         }
-        let out = super::build::repack(&bytes, &replacements).unwrap();
+        let out = super::build::repack(&bytes, &replacements).unwrap().0;
 
         // Output parses again, keeps originals, and carries translations.
         let mut reread = zip::ZipArchive::new(Cursor::new(out.as_slice())).unwrap();
@@ -466,7 +507,7 @@ mod tests {
                 replacements.insert(doc.path.clone(), rewritten);
             }
         }
-        let out = super::build::repack(&bytes, &replacements).unwrap();
+        let out = super::build::repack(&bytes, &replacements).unwrap().0;
         let mut reread = zip::ZipArchive::new(Cursor::new(out.as_slice())).unwrap();
         let ch2 = read_entry(&mut reread, "OEBPS/text/ch2.xhtml").unwrap();
         let ch2 = String::from_utf8(ch2).unwrap();
@@ -489,5 +530,75 @@ mod tests {
         assert_eq!(normalize_path("OEBPS", "/mimetype"), "mimetype");
         assert_eq!(normalize_path("", "a%20b.xhtml"), "a b.xhtml");
         assert_eq!(normalize_path("d", "ch1.xhtml#frag"), "d/ch1.xhtml");
+    }
+
+    /// EPUBs from some Java toolchains store entries percent-encoded while
+    /// OPF hrefs decode to readable paths. Parsing must still find the
+    /// chapters and repacking must still apply the rewrites.
+    #[test]
+    fn handles_percent_encoded_entry_names() {
+        let mut out = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut out));
+            let deflated = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            let mut add = |name: &str, content: &str| {
+                w.start_file(name, deflated).unwrap();
+                w.write_all(content.as_bytes()).unwrap();
+            };
+            add("mimetype", "application/epub+zip");
+            add(
+                "META-INF/container.xml",
+                r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+            );
+            add(
+                "content.opf",
+                r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bid">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bid">urn:test</dc:identifier>
+<dc:title>Encoded</dc:title>
+<dc:language>en</dc:language>
+</metadata>
+<manifest>
+<item id="c1" href="text/ch%20one.xhtml" media-type="application/xhtml+xml"/>
+</manifest>
+<spine><itemref idref="c1"/></spine>
+</package>"#,
+            );
+            // Stored percent-encoded; the OPF href decodes to "text/ch one.xhtml".
+            add("text/ch%20one.xhtml", r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>c1</title></head><body>
+<p>Encoded name chapter.</p>
+</body></html>"#);
+            w.finish().unwrap();
+        }
+
+        let mut book = parse(out.clone(), "/tmp/Encoded.epub").unwrap();
+        assert_eq!(book.info.segments.len(), 1, "chapter must be found");
+        assert!(book.info.warnings.is_empty(), "{:?}", book.info.warnings);
+
+        let mut replacements = std::collections::HashMap::new();
+        {
+            let docs = crate::types::docs_of_mut(&mut book);
+            for doc in docs {
+                for b in doc.blocks.iter_mut() {
+                    if !b.skipped {
+                        b.translation = Some("[MY]".into());
+                    }
+                }
+                let rewritten =
+                    super::html::rewrite_doc(&doc.html, &doc.blocks, MODE_TRANSLATED).unwrap();
+                replacements.insert(doc.path.clone(), rewritten);
+            }
+        }
+        let (out2, missed) = super::build::repack(&out, &replacements).unwrap();
+        assert_eq!(missed, 0, "every rewrite must match an archive entry");
+        let mut reread = zip::ZipArchive::new(Cursor::new(out2.as_slice())).unwrap();
+        let ch = read_entry(&mut reread, "text/ch%20one.xhtml").unwrap();
+        assert!(String::from_utf8(ch).unwrap().contains("[MY]"));
     }
 }

@@ -137,6 +137,7 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
                     text,
                     translation: None,
                     tag: "p".into(),
+                    parts: Vec::new(),
                 })
                 .collect(),
         })
@@ -175,6 +176,7 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
                     .sum(),
             })
             .collect(),
+        warnings: Vec::new(),
     };
 
     Ok(LoadedBook {

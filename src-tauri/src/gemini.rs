@@ -26,9 +26,14 @@ pub fn model_rpm(model: &str) -> u32 {
 /// Rough token estimate for mixed-script text: Latin scripts average ~4
 /// chars per token, Burmese ~2.3 chars per token.
 pub fn estimate_tokens(text: &str) -> usize {
-    let total = text.chars().count();
-    let ascii = text.chars().filter(|c| c.is_ascii()).count();
-    let other = total - ascii;
+    let (ascii, other) = text.chars().fold((0usize, 0usize), |(a, o), c| {
+        if c.is_ascii() { (a + 1, o) } else { (a, o + 1) }
+    });
+    estimate_counts(ascii, other)
+}
+
+/// Token estimate from pre-counted ASCII / non-ASCII code points.
+pub fn estimate_counts(ascii: usize, other: usize) -> usize {
     ascii / 4 + (other * 10) / 23
 }
 
@@ -47,6 +52,8 @@ struct LimiterState {
     base: Duration,
     interval: Duration,
     next_start: Option<Instant>,
+    /// Consecutive successful requests since the last 429.
+    streak: u32,
 }
 
 /// Spaces request starts at least `60s / rpm` apart so a job never exceeds
@@ -65,6 +72,7 @@ impl RateLimiter {
                 base,
                 interval: base,
                 next_start: None,
+                streak: 0,
             }),
         }
     }
@@ -90,10 +98,23 @@ impl RateLimiter {
     pub fn penalize(&self, cooldown: Duration) {
         let mut st = self.state.lock().unwrap();
         st.interval = (st.interval * 2).min(st.base * 4);
+        st.streak = 0;
         let target = Instant::now()
             .checked_add(cooldown)
             .unwrap_or_else(Instant::now);
         st.next_start = Some(st.next_start.map_or(target, |t| t.max(target)));
+    }
+
+    /// Called after a clean request: once the job has been running without a
+    /// 429 for a while, relax back toward the base pacing so an early 429
+    /// storm does not slow an otherwise-idle job forever.
+    pub fn note_success(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.streak += 1;
+        if st.streak >= 20 && st.interval > st.base {
+            st.interval = st.base + (st.interval - st.base) * 3 / 4;
+            st.streak = 0;
+        }
     }
 
     #[cfg(test)]
@@ -476,6 +497,34 @@ mod tests {
         assert_eq!(model_rpm("gemini-3.5-flash-lite"), 500);
         assert_eq!(model_rpm("gemini-3.8-flash"), 20);
         assert_eq!(model_rpm("something-else"), 20);
+    }
+
+    #[test]
+    fn limiter_relaxes_after_a_clean_stretch() {
+        let l = RateLimiter::new(60); // base spacing 1s
+        l.penalize(Duration::ZERO);
+        l.penalize(Duration::ZERO);
+        l.penalize(Duration::ZERO);
+        l.penalize(Duration::ZERO);
+        let (_, interval, _) = l.snapshot();
+        assert_eq!(interval, Duration::from_secs(4)); // 4x base after 429s
+
+        // Successes only count once the cap is reached; then the interval
+        // decays back toward base in steps of 25% of the excess per 20.
+        for _ in 0..19 {
+            l.note_success();
+        }
+        assert_eq!(l.snapshot().1, Duration::from_secs(4));
+        for _ in 0..8 {
+            for _ in 0..20 {
+                l.note_success();
+            }
+        }
+        let (_, interval, _) = l.snapshot();
+        assert!(
+            interval <= Duration::from_millis(1400),
+            "interval should decay toward base, got {interval:?}"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
   let testing = $state(false);
   let testResult = $state<{ ok: boolean; text: string } | null>(null);
   let savingState = $state(false);
+  let modalEl: HTMLDivElement | null = $state(null);
 
   $effect(() => {
     if (app.settingsOpen && app.settings) {
@@ -20,8 +21,37 @@
     }
   });
 
+  // Move focus into the dialog when it opens.
+  $effect(() => {
+    if (app.settingsOpen) modalEl?.focus();
+  });
+
   function close() {
     app.settingsOpen = false;
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+      return;
+    }
+    // Keep Tab cycling inside the dialog while it is open.
+    if (e.key !== "Tab" || !modalEl) return;
+    const focusables = [
+      ...modalEl.querySelectorAll<HTMLElement>("button, input, textarea, select, a[href]"),
+    ].filter((el) => !el.hasAttribute("disabled"));
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || !modalEl.contains(active))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (active === last || !modalEl.contains(active))) {
+      e.preventDefault();
+      first.focus();
+    }
   }
 
   async function test() {
@@ -63,9 +93,16 @@
   }
 </script>
 
+<svelte:window onkeydown={onKeydown} />
 {#if app.settingsOpen}
   <div class="overlay" role="presentation"><button class="overlay-close" aria-label="Close settings" onclick={close}></button>
-    <div class="modal" role="dialog" aria-modal="true" aria-label="Settings" tabindex="-1">
+    <div
+      class="modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Settings"
+      tabindex="-1"
+      bind:this={modalEl}>
       <header>
         <h2>Settings</h2>
         <button class="close" onclick={close} aria-label="Close settings">✕</button>
@@ -138,6 +175,7 @@
   }
   .modal {
     position: relative;
+    outline: none;
   }
   .modal {
     width: min(480px, 92vw);

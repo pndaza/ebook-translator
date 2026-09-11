@@ -70,6 +70,7 @@ pub async fn inspect_book(
     let info = book.info.clone();
     *state.book.lock().unwrap() = Some(Arc::new(Mutex::new(book)));
     *state.output.lock().unwrap() = None;
+    *state.progress.lock().unwrap() = None;
     Ok(info)
 }
 
@@ -79,36 +80,50 @@ pub async fn start_job(
     state: State<'_, AppState>,
     options: JobOptions,
 ) -> Result<()> {
-    if state.job_is_running() {
+    // Claim the job slot atomically — a check-then-set here let a double
+    // click spawn two concurrent jobs over the same book and log.
+    if state
+        .job_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Err(AppError::msg("a job is already running"));
     }
+    let release = |state: &AppState| state.job_running.store(false, Ordering::SeqCst);
     if !valid_mode(&options.mode) {
+        release(&state);
         return Err(AppError::msg("invalid mode"));
     }
     if options.target_lang.trim().is_empty() {
+        release(&state);
         return Err(AppError::msg("choose a target language"));
     }
     let api_key = state.settings.read().unwrap().api_key.clone();
     if api_key.trim().is_empty() {
+        release(&state);
         return Err(AppError::msg("set your Google AI Studio API key in Settings first"));
     }
 
-    let book: BookRef = state
-        .book
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| AppError::msg("load a book first"))?;
+    let book: BookRef = match state.book.lock().unwrap().clone() {
+        Some(b) => b,
+        None => {
+            release(&state);
+            return Err(AppError::msg("load a book first"));
+        }
+    };
 
     state.job_cancel.store(false, Ordering::SeqCst);
-    state.job_running.store(true, Ordering::SeqCst);
     let data_dir = state.data_dir.clone();
     let cancel = state.job_cancel.clone();
     let running = state.job_running.clone();
     let output = state.output.clone();
+    let progress = state.progress.clone();
 
     tauri::async_runtime::spawn(async move {
-        crate::job::run(app, book, options, api_key, data_dir, cancel, running, output).await;
+        crate::job::run(
+            app, book, options, api_key, data_dir, cancel, running, output, progress,
+        )
+        .await;
     });
     Ok(())
 }
@@ -156,4 +171,11 @@ pub fn get_current_book(state: State<'_, AppState>) -> Option<BookInfo> {
         .unwrap()
         .as_ref()
         .map(|b| b.lock().unwrap().info.clone())
+}
+
+/// Latest job-progress snapshot, so a webview reload can catch up without
+/// waiting for the next event.
+#[tauri::command]
+pub fn get_job_progress(state: State<'_, AppState>) -> Option<crate::types::JobProgress> {
+    state.progress.lock().unwrap().clone()
 }

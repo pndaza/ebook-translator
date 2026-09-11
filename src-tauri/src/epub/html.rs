@@ -216,25 +216,33 @@ fn rewrite_bilingual(html: &str, blocks: &[Block]) -> Result<String> {
 struct TranslatedState {
     cursor: usize,
     stack: Vec<usize>,
-    inserted: Vec<bool>,
 }
 
 fn rewrite_translated(html: &str, blocks: &[Block]) -> Result<String> {
     let state = Rc::new(RefCell::new(TranslatedState {
         cursor: 0,
         stack: Vec::new(),
-        inserted: vec![false; blocks.len()],
     }));
 
     let s = state.clone();
-    let element_handler = element!(BLOCK_SELECTOR, move |_el| {
+    let element_handler = element!(BLOCK_SELECTOR, move |el| {
         let mut st = s.borrow_mut();
         let idx = st.cursor;
         st.cursor += 1;
         st.stack.push(idx);
+        // Insert the translation directly after the block's start tag — not
+        // before its first text chunk, which may live inside a nested
+        // inline element (<em>, <a>...) and would inherit its semantics.
+        if let Some(b) = blocks.get(idx) {
+            if !b.skipped {
+                if let Some(tr) = &b.translation {
+                    el.prepend(&escape_html(tr), ContentType::Html);
+                }
+            }
+        }
         drop(st);
         let s2 = s.clone();
-        _el.on_end_tag(end_tag!(move |_end| {
+        el.on_end_tag(end_tag!(move |_end| {
             s2.borrow_mut().stack.pop();
             Ok(())
         }))?;
@@ -243,17 +251,11 @@ fn rewrite_translated(html: &str, blocks: &[Block]) -> Result<String> {
 
     let s = state.clone();
     let text_handler = text!("*", move |t| {
-        let mut st = s.borrow_mut();
+        let st = s.borrow_mut();
         if let Some(&idx) = st.stack.last() {
             if let Some(b) = blocks.get(idx) {
-                if !b.skipped {
-                    if let Some(tr) = &b.translation {
-                        if !st.inserted[idx] {
-                            st.inserted[idx] = true;
-                            t.before(&escape_html(tr), ContentType::Html);
-                        }
-                        t.remove();
-                    }
+                if !b.skipped && b.translation.is_some() {
+                    t.remove();
                 }
             }
         }
@@ -279,6 +281,7 @@ mod tests {
             skipped: !qualify(text),
             translation: translation.map(str::to_string),
             tag: tag.to_string(),
+            parts: Vec::new(),
         }
     }
 

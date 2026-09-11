@@ -25,7 +25,10 @@ pub fn run() {
             std::fs::create_dir_all(&config_dir)?;
             std::fs::create_dir_all(&data_dir)?;
             let settings_path = config_dir.join("settings.json");
-            let loaded = settings::load(&settings_path)?;
+            let loaded = settings::load(&settings_path).unwrap_or_else(|e| {
+                eprintln!("settings: {e}");
+                Default::default()
+            });
             app.manage(AppState {
                 settings: RwLock::new(loaded),
                 settings_path,
@@ -34,6 +37,7 @@ pub fn run() {
                 output: Arc::new(Mutex::new(None)),
                 job_cancel: Arc::new(AtomicBool::new(false)),
                 job_running: Arc::new(AtomicBool::new(false)),
+                progress: Arc::new(Mutex::new(None)),
             });
             Ok(())
         })
@@ -46,6 +50,7 @@ pub fn run() {
             commands::cancel_job,
             commands::save_output,
             commands::get_current_book,
+            commands::get_job_progress,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

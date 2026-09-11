@@ -6,11 +6,13 @@
 
   let { onloaded }: { onloaded: () => void } = $props();
   let dragging = $state(false);
-  let unlisten: (() => void) | null = null;
 
   $effect(() => {
-    const wv = getCurrentWebview();
-    const p = wv.onDragDropEvent((event) => {
+    // Browser preview has no Tauri webview; getCurrentWebview() would throw.
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    const p = getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "over") {
         dragging = true;
       } else if (event.payload.type === "leave") {
@@ -20,8 +22,16 @@
         void load(event.payload.paths[0]);
       }
     });
-    p.then((f) => (unlisten = f));
-    return () => unlisten?.();
+    // The listener resolves asynchronously — if the component is already
+    // gone, dispose immediately instead of leaking a global handler.
+    p.then((f) => {
+      if (disposed) f();
+      else unlisten = f;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   });
 
   async function browse() {
@@ -57,7 +67,7 @@
 </script>
 
 <section class="wrap">
-  <div class="drop" class:dragging role="button" tabindex="0" aria-label="Choose an ebook file" onclick={browse} onkeydown={(e) => e.key === "Enter" && browse()}>
+  <div class="drop" class:dragging role="button" tabindex="0" aria-label="Choose an ebook file" onclick={browse} onkeydown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), browse())}>
     <div class="page left" aria-hidden="true"></div>
     <div class="page right" aria-hidden="true"></div>
     <div class="inner">

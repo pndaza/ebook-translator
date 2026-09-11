@@ -12,12 +12,23 @@
       ? Math.min(100, Math.round((progress.charsDone / progress.charsTotal) * 100))
       : 0,
   );
-  const done = $derived(progress?.status === "completed");
+  const done = $derived(progress?.status === "completed" || progress?.status === "partial");
   const running = $derived(progress?.status === "running");
+  const headline = $derived(
+    progress?.status === "completed"
+      ? "Done"
+      : progress?.status === "partial"
+        ? "Done — with gaps"
+        : progress?.status === "cancelled"
+          ? "Paused"
+          : progress?.status === "failed"
+            ? "Failed"
+            : (progress?.status ?? ""),
+  );
 
   async function saveEpub() {
     if (!app.book) return;
-    const lang = app.settings?.targetLang?.split(" (")[0] ?? "translation";
+    const lang = app.jobLang || (app.settings?.targetLang?.split(" (")[0] ?? "translation");
     const safeTitle = app.book.title.replace(/[\\/:*?"<>|]/g, "").trim() || "book";
     const path = await save({
       defaultPath: `${safeTitle} (${lang}).epub`,
@@ -44,10 +55,11 @@
   <article class="card">
     <header>
       <div>
-        <p class="kind">{done ? "Translated" : "Translating"} — {app.book?.title ?? ""}</p>
-        <h2>
-          {#if done}Done{:else if progress.status === "cancelled"}Paused{:else}{progress.status}{/if}
-        </h2>
+        <p class="kind">
+          {done ? "Translated" : progress.status === "failed" ? "Translation failed" : "Translating"}
+          — {app.book?.title ?? ""}
+        </p>
+        <h2>{headline}</h2>
       </div>
       <div class="numbers">
         <span class="mono">{progress.batchesDone}/{progress.batchesTotal} batches</span>
@@ -70,6 +82,9 @@
 
     {#if progress.error}
       <p class="error" role="alert">{progress.error}</p>
+    {/if}
+    {#if app.error}
+      <p class="error" role="alert">{app.error}</p>
     {/if}
 
     <ul class="toc">
