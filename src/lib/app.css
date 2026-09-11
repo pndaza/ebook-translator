@@ -1,0 +1,148 @@
+/* Translator's desk: book-cloth chrome, paper surfaces, muted gilt. */
+:root {
+  --cloth: #1d2b3a;
+  --cloth-deep: #152130;
+  --cloth-line: #2c3e51;
+  --paper: #f6f1e7;
+  --paper-dim: #ece5d5;
+  --paper-edge: #ddd2ba;
+  --ink: #2a2620;
+  --ink-soft: #6f6553;
+  --ink-faint: #a2957c;
+  --gilt: #c79a3b;
+  --gilt-deep: #a67c26;
+  --gilt-bright: #e2b658;
+  --error: #a03d2d;
+  --ok: #4d6b3c;
+  --font-display: "Fraunces Variable", "Fraunces", Georgia, serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--cloth-deep);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+#app {
+  height: 100%;
+}
+
+::selection {
+  background: var(--gilt);
+  color: var(--cloth-deep);
+}
+
+:focus-visible {
+  outline: 2px solid var(--gilt-bright);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* --- shared controls --- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 18px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 13.5px;
+  transition: transform 0.08s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn-primary {
+  background: var(--gilt);
+  color: #241a06;
+  box-shadow: 0 2px 0 var(--gilt-deep);
+}
+.btn-primary:hover {
+  background: var(--gilt-bright);
+}
+.btn-primary:disabled {
+  background: var(--paper-edge);
+  color: var(--ink-faint);
+  box-shadow: none;
+  cursor: default;
+}
+.btn-ghost {
+  color: var(--ink-soft);
+  border: 1px solid var(--paper-edge);
+  background: transparent;
+}
+.btn-ghost:hover {
+  border-color: var(--ink-faint);
+  color: var(--ink);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.field > label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.field input[type="text"],
+.field input[type="password"],
+.field select {
+  background: #fffdf7;
+  border: 1px solid var(--paper-edge);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--ink);
+  width: 100%;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+.field input:focus,
+.field select:focus {
+  border-color: var(--gilt);
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001s !important;
+    transition-duration: 0.001s !important;
+  }
+}
