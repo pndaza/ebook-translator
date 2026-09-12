@@ -293,7 +293,7 @@ when customary in {lang}.\n\
             "model": self.model,
             "system_instruction": system,
             "input": serde_json::to_string(&json!({ "paragraphs": items })).unwrap_or_default(),
-            "generation_config": { "thinking_level": "low", "temperature": 0.2 },
+            "generation_config": { "thinking_level": "low", "temperature": 0.6 },
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
