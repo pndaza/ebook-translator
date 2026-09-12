@@ -68,3 +68,16 @@ updates from the published `latest.json`.
   private key lives only in the `TAURI_SIGNING_PRIVATE_KEY` repo secret (never in git)
 - Local `tauri build` bundles need those env vars set; `tauri dev` and `pnpm build`
   do not
+
+### First launch: Gatekeeper
+
+The app is ad-hoc signed (no Apple notarization), so macOS may warn that it "cannot
+verify the developer". After moving the app to `/Applications`, either right-click it
+and choose **Open → Open**, or clear the quarantine flag in Terminal:
+
+```sh
+xattr -cr /Applications/ebook-translator.app
+```
+
+(`sudo xattr -rd com.apple.quarantine /Applications/ebook-translator.app` does the
+same for just the quarantine attribute.)
