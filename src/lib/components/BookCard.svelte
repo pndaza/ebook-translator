@@ -35,7 +35,7 @@
   let model = $state(seeded.model);
   let starting = $state(false);
   let requests = $state<number | null>(null);
-  let cachedBatches = $state(0);
+  let doneBatches = $state(0);
   let usage = $state<UsageSnapshot | null>(null);
 
   // Today's usage for the selected model, fetched once per card visit.
@@ -68,13 +68,13 @@
       .then((r) => {
         if (m === model && l === lang && instr === (app.settings?.customInstructions ?? "")) {
           requests = r?.requests ?? null;
-          cachedBatches = r?.cachedBatches ?? 0;
+          doneBatches = r?.doneBatches ?? 0;
         }
       })
       .catch(() => {
         if (m === model) {
           requests = null;
-          cachedBatches = 0;
+          doneBatches = 0;
         }
       });
   });
@@ -163,8 +163,8 @@
           <p class="rate-hint">{MODEL_RATE_HINT}</p>
           {#if requests !== null}
             <p class="estimate">
-              ≈ {requests} requests for this book{cachedBatches
-                ? ` · ${cachedBatches} ${cachedBatches === 1 ? "batch" : "batches"} from cache`
+              ≈ {requests} requests for this book{doneBatches
+                ? ` · ${doneBatches} ${doneBatches === 1 ? "batch" : "batches"} already translated`
                 : ""}
             </p>
           {/if}

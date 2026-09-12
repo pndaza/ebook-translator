@@ -187,15 +187,16 @@ pub fn get_job_progress(state: State<'_, AppState>) -> Option<crate::types::JobP
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EstimateResult {
-    /// Requests the job will actually send (fully cached batches excluded).
+    /// Requests the job will actually send, discounting both resume-log
+    /// batches and fully cache-covered ones.
     pub requests: usize,
-    /// Batches every segment of which is already in the translation cache.
-    pub cached_batches: usize,
+    /// Batches that need no request (resumed or fully cached).
+    pub done_batches: usize,
 }
 
 /// Number of API requests the loaded book needs with the given model,
-/// computed with the same batching the job will run and discounted by
-/// whatever the persistent translation cache already covers.
+/// computed with the same batching, resume log, and translation cache the
+/// job will use.
 #[tauri::command]
 pub async fn estimate_requests(
     state: State<'_, AppState>,
@@ -209,28 +210,27 @@ pub async fn estimate_requests(
         .unwrap()
         .clone()
         .ok_or_else(|| AppError::msg("load a book first"))?;
-    let (batches, prefix) = {
-        let prefix = crate::cache::TranslationCache::prefix(&model, &target_lang, &custom_instructions);
-        let batches = tauri::async_runtime::spawn_blocking(move || {
-            let book = book.lock().unwrap();
-            let docs = match &book.source {
-                crate::types::BookSource::Epub { docs, .. }
-                | crate::types::BookSource::Pdf { docs, .. } => docs,
-            };
-            crate::job::build_batches(docs, &model)
-        })
-        .await
-        .map_err(|e| AppError::msg(format!("estimate task failed: {e}")))?;
-        (batches, prefix)
-    };
-    let cache = state.cache.lock().unwrap();
-    let cached_batches = batches
-        .iter()
-        .filter(|b| b.items.iter().all(|i| cache.get(&prefix, &i.text).is_some()))
-        .count();
+    let cache = state.cache.clone();
+    let data_dir = state.data_dir.clone();
+    let (requests, done_batches) = tauri::async_runtime::spawn_blocking(move || {
+        let book = book.lock().unwrap();
+        let docs = match &book.source {
+            crate::types::BookSource::Epub { docs, .. }
+            | crate::types::BookSource::Pdf { docs, .. } => docs,
+        };
+        let batches = crate::job::build_batches(docs, &model);
+        let key = crate::job::resume_key(&book, &model, &target_lang, &custom_instructions);
+        let resumed = crate::job::load_resume(&data_dir.join("jobs").join(format!("{key}.jsonl")));
+        let prefix =
+            crate::cache::TranslationCache::prefix(&model, &target_lang, &custom_instructions);
+        let cache = cache.lock().unwrap();
+        crate::job::count_pending_requests(&batches, &resumed, &prefix, &cache)
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("estimate task failed: {e}")))?;
     Ok(EstimateResult {
-        requests: batches.len() - cached_batches,
-        cached_batches,
+        requests,
+        done_batches,
     })
 }
 

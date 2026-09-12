@@ -69,7 +69,7 @@ export interface JobProgress {
 
 export interface EstimateResult {
   requests: number;
-  cachedBatches: number;
+  doneBatches: number;
 }
 
 export interface CacheStats {
@@ -274,7 +274,7 @@ export const estimateRequests = (
   const tokens = Math.ceil(fixtureBook.totalChars / 2.3);
   return Promise.resolve({
     requests: Math.max(1, Math.ceil(tokens / budget)),
-    cachedBatches: 0,
+    doneBatches: 0,
   });
 };
 

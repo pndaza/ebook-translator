@@ -304,6 +304,34 @@ fn truncate_for_sample(batches: Vec<Batch>, max_items: usize) -> Vec<Batch> {
     out
 }
 
+/// Exact number of API requests a run of `batches` would send right now,
+/// and how many batches need none: resume-log batches are replayed from
+/// disk, batches whose every segment sits in the translation cache are
+/// served from it, and the rest cost one request each (partially cached
+/// ones a smaller one).
+pub(crate) fn count_pending_requests(
+    batches: &[Batch],
+    resumed: &HashMap<usize, BTreeMap<usize, String>>,
+    prefix: &str,
+    cache: &TranslationCache,
+) -> (usize, usize) {
+    let mut requests = 0usize;
+    let mut done = 0usize;
+    for (bi, batch) in batches.iter().enumerate() {
+        if resumed.contains_key(&bi)
+            || batch
+                .items
+                .iter()
+                .all(|i| cache.get(prefix, &i.text).is_some())
+        {
+            done += 1;
+        } else {
+            requests += 1;
+        }
+    }
+    (requests, done)
+}
+
 /// Store one translated piece, joining split blocks once all parts arrived.
 pub(crate) fn apply_translation(docs: &mut [ContentDoc], item: &BatchItem, t: &str) {
     let block = &mut docs[item.d].blocks[item.b];
@@ -354,7 +382,7 @@ pub fn resume_key(book: &LoadedBook, model: &str, lang: &str, instructions: &str
     )
 }
 
-fn load_resume(path: &PathBuf) -> HashMap<usize, BTreeMap<usize, String>> {
+pub(crate) fn load_resume(path: &PathBuf) -> HashMap<usize, BTreeMap<usize, String>> {
     let mut map = HashMap::new();
     let Ok(f) = File::open(path) else {
         return map;
@@ -1264,6 +1292,45 @@ mod tests {
         // Below the cap nothing is trimmed.
         let small = truncate_for_sample(vec![mk(4), mk(4)], 25);
         assert_eq!(small.iter().map(|b| b.items.len()).sum::<usize>(), 8);
+    }
+
+    #[test]
+    fn request_count_discounts_resume_and_cache() {
+        let dir = std::env::temp_dir().join(format!("ebtr-estimate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = TranslationCache::open(&dir);
+        let mk = |tag: usize| Batch {
+            items: (0..2)
+                .map(|i| BatchItem {
+                    d: 0,
+                    b: i,
+                    part: None,
+                    text: format!("para {tag}-{i} text"),
+                })
+                .collect(),
+            chars: 0,
+            tokens: 0,
+        };
+        let batches = vec![mk(0), mk(1), mk(2)];
+        let prefix = TranslationCache::prefix("model-a", "Burmese", "");
+
+        // Nothing done yet: every batch costs a request.
+        assert_eq!(
+            count_pending_requests(&batches, &HashMap::new(), &prefix, &cache),
+            (3, 0)
+        );
+        // Batch 1 in the resume log: replayed, no request.
+        let mut resumed = HashMap::new();
+        resumed.insert(1usize, BTreeMap::from([(1usize, "done".to_string())]));
+        assert_eq!(count_pending_requests(&batches, &resumed, &prefix, &cache), (2, 1));
+        // Batch 2 fully cached: served, no request.
+        cache.put(&prefix, "para 2-0 text", "x");
+        cache.put(&prefix, "para 2-1 text", "y");
+        assert_eq!(count_pending_requests(&batches, &resumed, &prefix, &cache), (1, 2));
+        // Batch 0 only partially cached: still one (smaller) request.
+        cache.put(&prefix, "para 0-0 text", "z");
+        assert_eq!(count_pending_requests(&batches, &resumed, &prefix, &cache), (1, 2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
