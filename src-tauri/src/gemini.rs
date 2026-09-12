@@ -141,6 +141,17 @@ pub enum GeminiFailure {
     Fatal(AppError),
     /// Transient; already retried the configured number of times.
     Exhausted(AppError),
+    /// The model hit an output limit mid-answer. Retrying the same request
+    /// fails the same way — the caller should split the batch instead.
+    Truncated(AppError),
+}
+
+impl GeminiFailure {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Fatal(e) | Self::Exhausted(e) | Self::Truncated(e) => e.to_string(),
+        }
+    }
 }
 
 fn backoff_delay(attempt: u32, retry_after: Option<u64>) -> Duration {
@@ -150,6 +161,20 @@ fn backoff_delay(attempt: u32, retry_after: Option<u64>) -> Duration {
     let base = 1000u64.saturating_mul(1u64 << attempt.min(5)); // 1s, 2s, 4s, 8s, 16s
     let jitter = rand::random_range(0..=500u64);
     Duration::from_millis(base + jitter)
+}
+
+/// The Interactions API reports "completed" only when the model finished its
+/// answer; an output cut off by the cap surfaces as another status. Retrying
+/// such a request unchanged always fails — the caller splits the batch.
+fn check_output_status(value: &Value) -> std::result::Result<(), AppError> {
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("completed");
+    if status == "completed" {
+        Ok(())
+    } else {
+        Err(AppError::msg(format!(
+            "model output incomplete (status: {status}) — response was cut off by the output limit"
+        )))
+    }
 }
 
 impl GeminiClient {
@@ -330,6 +355,7 @@ when customary in {lang}.\n\
             if !status.is_success() {
                 return Err(GeminiFailure::Fatal(Self::api_error(status, &value)));
             }
+            check_output_status(&value).map_err(GeminiFailure::Truncated)?;
 
             let tokens = value
                 .pointer("/usage/total_tokens")
@@ -533,6 +559,17 @@ mod tests {
         assert_eq!(estimate_tokens("မင်္ဂလာပါကျွန်ုပ်"), 7); // 17 non-ascii code points / 2.3
         assert_eq!(batch_token_budget("gemini-3.5-flash-lite"), 5_000);
         assert_eq!(batch_token_budget("gemini-3.8-flash"), 10_000);
+    }
+
+    #[test]
+    fn flags_incomplete_status_as_truncation() {
+        let v: Value = serde_json::from_str(r#"{"status": "incomplete"}"#).unwrap();
+        let err = check_output_status(&v).unwrap_err();
+        assert!(err.to_string().contains("incomplete"), "{err}");
+        let v: Value = serde_json::from_str(r#"{"status": "completed"}"#).unwrap();
+        assert!(check_output_status(&v).is_ok());
+        // Missing status (older shapes) is treated as completed.
+        assert!(check_output_status(&serde_json::json!({})).is_ok());
     }
 
     #[test]

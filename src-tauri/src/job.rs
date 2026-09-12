@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
+use crate::state::BookRef;
+
 pub const EVENT_PROGRESS: &str = "job-progress";
 pub const EVENT_LOG: &str = "job-log";
 
@@ -20,7 +22,7 @@ pub const EVENT_LOG: &str = "job-log";
 /// pipe full at the 20 RPM Flash limit, harmless at Flash-Lite's 500 RPM.
 const CONCURRENCY: usize = 3;
 /// Safety cap on paragraphs per request, so alignment stays manageable.
-const MAX_BATCH_BLOCKS: usize = 100;
+pub(crate) const MAX_BATCH_BLOCKS: usize = 100;
 
 #[derive(Clone)]
 pub struct BatchItem {
@@ -144,7 +146,7 @@ pub fn build_batches(docs: &[ContentDoc], model: &str) -> Vec<Batch> {
 }
 
 /// Store one translated piece, joining split blocks once all parts arrived.
-fn apply_translation(docs: &mut [ContentDoc], item: &BatchItem, t: &str) {
+pub(crate) fn apply_translation(docs: &mut [ContentDoc], item: &BatchItem, t: &str) {
     let block = &mut docs[item.d].blocks[item.b];
     match item.part {
         None => block.translation = Some(t.to_string()),
@@ -573,49 +575,162 @@ async fn worker_loop(
             continue; // drain the queue without doing work
         }
 
-        limiter.acquire().await;
-
-        let paras: Vec<(usize, String)> = batches[bi]
-            .items
-            .iter()
-            .enumerate()
-            .map(|(k, item)| (k + 1, item.text.clone()))
-            .collect();
-        let chars = batches[bi].chars;
-
-        match client
-            .translate_batch(&limiter, &opts.target_lang, &opts.custom_instructions, &paras)
-            .await
-        {
-            Ok(res) => {
-                {
-                    let mut book = book_ref.lock().unwrap();
-                    let docs = match &mut book.source {
-                        BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
-                    };
-                    for (k, item) in batches[bi].items.iter().enumerate() {
-                        if let Some(t) = res.translations.get(&(k + 1)) {
-                            apply_translation(docs, item, t);
-                        }
-                    }
-                }
-                append_resume(&mut resume_writer.lock().unwrap(), bi, &res.translations);
-                limiter.note_success();
-                ctx.tokens.fetch_add(res.total_tokens, Ordering::Relaxed);
-                *ctx.chars_done.lock().unwrap() += chars;
+        let outcome = translate_batch_items(
+            client.clone(),
+            limiter.clone(),
+            opts.clone(),
+            book_ref.clone(),
+            bi,
+            &batches[bi],
+            cancel.clone(),
+            ctx.clone(),
+            fatal.clone(),
+            resume_writer.clone(),
+        )
+        .await;
+        match outcome {
+            BatchOutcome::Done => {
                 *ctx.done.lock().unwrap() += 1;
             }
-            Err(GeminiFailure::Fatal(e)) => {
-                *fatal.lock().unwrap() = Some(e.to_string());
-                cancel.store(true, Ordering::SeqCst);
-            }
-            Err(GeminiFailure::Exhausted(e)) => {
+            BatchOutcome::Failed(msg) => {
                 *ctx.failed.lock().unwrap() += 1;
                 *ctx.done.lock().unwrap() += 1;
-                ctx.log(format!("Batch {} failed after retries: {e}", bi + 1));
+                ctx.log(format!("Batch {} failed after retries: {msg}", bi + 1));
             }
+            BatchOutcome::Skipped => {}
         }
         ctx.emit("running", None, false);
+    }
+}
+
+/// Outcome of translating one batch (possibly via recursive half-splits).
+#[derive(PartialEq)]
+enum BatchOutcome {
+    /// Every item translated.
+    Done,
+    /// Exhausted after retries (and splits, for truncation).
+    Failed(String),
+    /// Cancelled or fatally aborted before doing anything.
+    Skipped,
+}
+
+/// Translate one full batch, keeping its resume entry all-or-nothing: the
+/// union map only reaches the resume log when every item translated, so a
+/// replayed batch is always fully covered.
+#[allow(clippy::too_many_arguments)]
+async fn translate_batch_items(
+    client: Arc<GeminiClient>,
+    limiter: Arc<crate::gemini::RateLimiter>,
+    opts: JobOptions,
+    book: BookRef,
+    bi: usize,
+    batch: &Batch,
+    cancel: Arc<AtomicBool>,
+    ctx: Arc<ProgressCtx>,
+    fatal: Arc<Mutex<Option<String>>>,
+    resume_writer: Arc<Mutex<Option<File>>>,
+) -> BatchOutcome {
+    let mut union: BTreeMap<usize, String> = BTreeMap::new();
+    let outcome = translate_items(
+        &client,
+        &limiter,
+        &opts,
+        &book,
+        &batch.items,
+        0,
+        &format!("Batch {}", bi + 1),
+        &cancel,
+        &ctx,
+        &fatal,
+        &mut union,
+    )
+    .await;
+    if outcome == BatchOutcome::Done && union.len() == batch.items.len() {
+        append_resume(&mut resume_writer.lock().unwrap(), bi, &union);
+    }
+    outcome
+}
+
+/// Translate a slice of batch items. Output-truncated requests are split in
+/// half and retried recursively — retrying the same oversized request would
+/// fail identically, while halves eventually fit.
+#[allow(clippy::too_many_arguments)]
+async fn translate_items(
+    client: &GeminiClient,
+    limiter: &crate::gemini::RateLimiter,
+    opts: &JobOptions,
+    book: &BookRef,
+    items: &[BatchItem],
+    offset: usize,
+    label: &str,
+    cancel: &Arc<AtomicBool>,
+    ctx: &ProgressCtx,
+    fatal: &Arc<Mutex<Option<String>>>,
+    union: &mut BTreeMap<usize, String>,
+) -> BatchOutcome {
+    if cancel.load(Ordering::SeqCst) || fatal.lock().unwrap().is_some() {
+        return BatchOutcome::Skipped;
+    }
+
+    limiter.acquire().await;
+    let paras: Vec<(usize, String)> = items
+        .iter()
+        .enumerate()
+        .map(|(k, item)| (k + 1, item.text.clone()))
+        .collect();
+    let chars: usize = items.iter().map(|i| i.text.chars().count()).sum();
+
+    match client
+        .translate_batch(limiter, &opts.target_lang, &opts.custom_instructions, &paras)
+        .await
+    {
+        Ok(res) => {
+            {
+                let mut book = book.lock().unwrap();
+                let docs = match &mut book.source {
+                    BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
+                };
+                for (k, item) in items.iter().enumerate() {
+                    if let Some(t) = res.translations.get(&(k + 1)) {
+                        apply_translation(docs, item, t);
+                    }
+                }
+            }
+            for (k, t) in &res.translations {
+                union.insert(offset + k, t.clone());
+            }
+            limiter.note_success();
+            ctx.tokens.fetch_add(res.total_tokens, Ordering::Relaxed);
+            *ctx.chars_done.lock().unwrap() += chars;
+            BatchOutcome::Done
+        }
+        Err(GeminiFailure::Fatal(e)) => {
+            *fatal.lock().unwrap() = Some(e.to_string());
+            cancel.store(true, Ordering::SeqCst);
+            BatchOutcome::Failed(e.to_string())
+        }
+        Err(GeminiFailure::Truncated(e)) if items.len() > 1 => {
+            ctx.log(format!("{label}: {e} — splitting into halves and retrying"));
+            let mid = items.len() / 2;
+            let first = Box::pin(translate_items(
+                client, limiter, opts, book, &items[..mid], offset, &format!("{label} (part 1)"),
+                cancel, ctx, fatal, union,
+            ))
+            .await;
+            let second = Box::pin(translate_items(
+                client, limiter, opts, book, &items[mid..], offset + mid,
+                &format!("{label} (part 2)"), cancel, ctx, fatal, union,
+            ))
+            .await;
+            match (first, second) {
+                (BatchOutcome::Done, BatchOutcome::Done) => BatchOutcome::Done,
+                (BatchOutcome::Skipped, other) | (other, BatchOutcome::Skipped) => other,
+                (BatchOutcome::Failed(m), _) | (_, BatchOutcome::Failed(m)) => {
+                    BatchOutcome::Failed(m)
+                }
+            }
+        }
+        Err(e) => BatchOutcome::Failed(e.message()),
     }
 }
 

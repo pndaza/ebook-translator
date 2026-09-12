@@ -43,7 +43,8 @@ src-tauri/src/
 - 3 parallel requests for every model, paced automatically to its free-tier rate limit (Flash-Lite 500/min, Flash 20/min)
 - On a 429 the whole job automatically slows down and retries with long delays (up to 12 times, honoring Retry-After), so rate limits never fail a batch; 5xx/network errors retry with exponential backoff
 - Resume cache: `~/Library/Application Support/com.pndaza.ebook-translator/jobs/<hash-model-lang>.jsonl`
-- Tests: `cd src-tauri && cargo test` (18 tests incl. full EPUB round-trip)
+- Tests: `cd src-tauri && cargo test` (28 tests incl. full EPUB round-trip)
+- Debug a book pipeline offline: `INSPECT_PATH=<file> cargo test debug_inspect -- --nocapture`
 
 ## Notes & limits
 

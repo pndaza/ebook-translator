@@ -8,6 +8,11 @@ mod settings;
 mod state;
 mod types;
 
+#[cfg(test)]
+mod debug_inspect;
+#[cfg(test)]
+mod debug_translate;
+
 use state::AppState;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
