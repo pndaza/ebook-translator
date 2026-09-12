@@ -1,3 +1,4 @@
+use crate::cache::TranslationCache;
 use crate::error::Result;
 use crate::gemini::{GeminiClient, GeminiFailure};
 use crate::types::{
@@ -9,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
@@ -23,6 +24,139 @@ pub const EVENT_LOG: &str = "job-log";
 const CONCURRENCY: usize = 3;
 /// Safety cap on paragraphs per request, so alignment stays manageable.
 pub(crate) const MAX_BATCH_BLOCKS: usize = 100;
+/// Sample runs translate roughly this many paragraphs before stopping.
+const SAMPLE_ITEMS: usize = 25;
+
+/// The persistent cache plus this job's language/instructions. The key
+/// prefix is derived per model, so segments land under whichever model
+/// actually translated them even mid-job fallback switches.
+#[derive(Clone)]
+struct SegmentCache {
+    store: Arc<Mutex<TranslationCache>>,
+    lang: String,
+    instructions: String,
+}
+
+impl SegmentCache {
+    fn lookup(&self, model: &str, text: &str) -> Option<String> {
+        self.store
+            .lock()
+            .unwrap()
+            .get(&self.prefix(model), text)
+    }
+    fn record(&self, model: &str, text: &str, translation: &str) {
+        self.store
+            .lock()
+            .unwrap()
+            .put(&self.prefix(model), text, translation);
+    }
+    fn prefix(&self, model: &str) -> String {
+        TranslationCache::prefix(model, &self.lang, &self.instructions)
+    }
+}
+
+/// Hands workers the client for the job's current model, and advances to a
+/// fallback model (with its own free-tier quota) when one dies for the day.
+/// All state is mutex-guarded so concurrent workers switch together.
+struct ClientPool {
+    api_key: String,
+    enabled: bool,
+    current: Mutex<String>,
+    exhausted: Mutex<std::collections::HashSet<String>>,
+    /// Quota day the `exhausted` set belongs to, so a job that runs across
+    /// the daily reset forgets dead models once their quota returns.
+    exhausted_day: Mutex<u64>,
+    clients: Mutex<HashMap<String, Arc<GeminiClient>>>,
+    usage: Arc<crate::usage::UsageTracker>,
+}
+
+impl ClientPool {
+    fn new(api_key: &str, model: &str, enabled: bool, usage: Arc<crate::usage::UsageTracker>) -> Self {
+        // Seed with models the server already declared dead today, so a new
+        // job skips them instead of paying a 429 to rediscover each one.
+        let day = usage.day();
+        let exhausted = usage
+            .snapshot()
+            .models
+            .into_iter()
+            .filter(|(_, m)| m.exhausted)
+            .map(|(m, _)| m)
+            .collect();
+        Self {
+            api_key: api_key.to_string(),
+            enabled,
+            current: Mutex::new(model.to_string()),
+            exhausted: Mutex::new(exhausted),
+            exhausted_day: Mutex::new(day),
+            clients: Mutex::new(HashMap::new()),
+            usage,
+        }
+    }
+
+    /// The client + model every new request should use right now.
+    fn pair(&self) -> (Arc<GeminiClient>, String) {
+        let model = self.current.lock().unwrap().clone();
+        (self.client_for(&model), model)
+    }
+
+    fn client_for(&self, model: &str) -> Arc<GeminiClient> {
+        let mut clients = self.clients.lock().unwrap();
+        clients
+            .entry(model.to_string())
+            .or_insert_with(|| {
+                Arc::new(GeminiClient::with_usage(
+                    &self.api_key,
+                    model,
+                    Some(self.usage.clone()),
+                ))
+            })
+            .clone()
+    }
+
+    /// If the job's starting model is already exhausted today, hop to its
+    /// first live fallback right away.
+    fn skip_exhausted_current(&self) -> Option<String> {
+        let current = self.current.lock().unwrap().clone();
+        if !self.exhausted.lock().unwrap().contains(&current) {
+            return None;
+        }
+        self.advance(&current)
+    }
+
+    fn mark_exhausted(&self, model: &str) {
+        self.usage.mark_exhausted(model);
+    }
+
+    /// Mark `died` quota-dead and move to its next fallback. Returns the new
+    /// model — including when a peer worker already switched past `died`, so
+    /// the caller just retries on the new current. `None` means switching is
+    /// disabled or every same-tier model is exhausted.
+    fn advance(&self, died: &str) -> Option<String> {
+        let mut current = self.current.lock().unwrap();
+        let mut exhausted = self.exhausted.lock().unwrap();
+        // Across the daily reset the dead models come back to life.
+        {
+            let today = self.usage.day();
+            let mut day = self.exhausted_day.lock().unwrap();
+            if *day != today {
+                *day = today;
+                exhausted.clear();
+            }
+        }
+        exhausted.insert(died.to_string());
+        if !self.enabled {
+            return None;
+        }
+        if *current != died {
+            return Some(current.clone());
+        }
+        let next = crate::gemini::fallback_models(died)
+            .into_iter()
+            .find(|m| !exhausted.contains(m))?;
+        *current = next.clone();
+        Some(next)
+    }
+}
 
 #[derive(Clone)]
 pub struct BatchItem {
@@ -145,6 +279,31 @@ pub fn build_batches(docs: &[ContentDoc], model: &str) -> Vec<Batch> {
     batches
 }
 
+/// Keep only the first `max_items` items across batches, trimming the
+/// boundary batch instead of inventing a tiny extra request.
+fn truncate_for_sample(batches: Vec<Batch>, max_items: usize) -> Vec<Batch> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for mut batch in batches {
+        if used >= max_items {
+            break;
+        }
+        let room = max_items - used;
+        if batch.items.len() > room {
+            batch.items.truncate(room);
+            batch.chars = batch.items.iter().map(|i| i.text.chars().count()).sum();
+            batch.tokens = batch
+                .items
+                .iter()
+                .map(|i| crate::gemini::estimate_tokens(&i.text))
+                .sum();
+        }
+        used += batch.items.len();
+        out.push(batch);
+    }
+    out
+}
+
 /// Store one translated piece, joining split blocks once all parts arrived.
 pub(crate) fn apply_translation(docs: &mut [ContentDoc], item: &BatchItem, t: &str) {
     let block = &mut docs[item.d].blocks[item.b];
@@ -172,7 +331,8 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// Identity of a translation run for resume caching. Custom instructions are
 /// part of the translation function — changing them must invalidate the cache,
-/// or stale translations would be silently replayed.
+/// or stale translations would be silently replayed. So is the prompt
+/// version, so a resumed book never mixes old- and new-prompt batches.
 pub fn resume_key(book: &LoadedBook, model: &str, lang: &str, instructions: &str) -> String {
     let bytes = match &book.source {
         BookSource::Epub { bytes, .. } => bytes,
@@ -183,13 +343,14 @@ pub fn resume_key(book: &LoadedBook, model: &str, lang: &str, instructions: &str
     let mut ih = Sha256::new();
     ih.update(instructions.trim().as_bytes());
     format!(
-        "{}-{}-{}-{}-{}-{}",
+        "{}-{}-{}-{}-{}-{}-v{}",
         to_hex(&h.finalize()),
         model,
         lang,
         crate::gemini::batch_token_budget(model),
         MAX_BATCH_BLOCKS,
-        &to_hex(&ih.finalize())[..8]
+        &to_hex(&ih.finalize())[..8],
+        crate::cache::PROMPT_VERSION
     )
 }
 
@@ -237,6 +398,11 @@ struct ProgressCtx {
     failed: Mutex<usize>,
     chars_done: Mutex<usize>,
     tokens: AtomicU64,
+    sample: bool,
+    cached_segments: AtomicUsize,
+    model: String,
+    target_lang: String,
+    mode: String,
     /// Latest snapshot, readable from the UI at any time (`get_job_progress`).
     snapshot_slot: Arc<Mutex<Option<JobProgress>>>,
 }
@@ -280,6 +446,11 @@ impl ProgressCtx {
             tokens_used: self.tokens.load(Ordering::Relaxed),
             error,
             output_ready,
+            sample: self.sample,
+            cached_segments: self.cached_segments.load(Ordering::Relaxed),
+            model: self.model.clone(),
+            target_lang: self.target_lang.clone(),
+            mode: self.mode.clone(),
         }
     }
 
@@ -303,6 +474,9 @@ pub async fn run(
     opts: JobOptions,
     api_key: String,
     data_dir: PathBuf,
+    cache: Arc<Mutex<TranslationCache>>,
+    usage: Arc<crate::usage::UsageTracker>,
+    auto_switch: bool,
     cancel: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     output: Arc<Mutex<Option<Vec<u8>>>>,
@@ -317,6 +491,9 @@ pub async fn run(
         &opts,
         &api_key,
         &data_dir,
+        &cache,
+        &usage,
+        auto_switch,
         &cancel,
         &output,
         &snapshot_slot,
@@ -338,6 +515,11 @@ pub async fn run(
                 failed: Mutex::new(0),
                 chars_done: Mutex::new(0),
                 tokens: AtomicU64::new(0),
+                sample: opts.sample,
+                cached_segments: AtomicUsize::new(0),
+                model: opts.model.clone(),
+                target_lang: opts.target_lang.clone(),
+                mode: opts.mode.clone(),
                 snapshot_slot,
             };
             ctx.log(format!("Job failed: {e}"));
@@ -353,27 +535,44 @@ async fn run_inner(
     opts: &JobOptions,
     api_key: &str,
     data_dir: &std::path::Path,
+    cache: &Arc<Mutex<TranslationCache>>,
+    usage: &Arc<crate::usage::UsageTracker>,
+    auto_switch: bool,
     cancel: &Arc<AtomicBool>,
     output: &Arc<Mutex<Option<Vec<u8>>>>,
     snapshot_slot: &Arc<Mutex<Option<JobProgress>>>,
     ctx_slot: &Arc<Mutex<Option<Arc<ProgressCtx>>>>,
 ) -> Result<()> {
-    let key = resume_key(
-        &book_ref.lock().unwrap(),
-        &opts.model,
-        &opts.target_lang,
-        &opts.custom_instructions,
-    );
-    let log_path = data_dir.join("jobs").join(format!("{key}.jsonl"));
-    if let Some(dir) = log_path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let seg_cache = SegmentCache {
+        store: cache.clone(),
+        lang: opts.target_lang.clone(),
+        instructions: opts.custom_instructions.clone(),
+    };
+
+    let mut batches = build_batches(docs_of(&book_ref.lock().unwrap()), &opts.model);
+    if opts.sample {
+        batches = truncate_for_sample(batches, SAMPLE_ITEMS);
     }
 
-    let batches = build_batches(docs_of(&book_ref.lock().unwrap()), &opts.model);
+    // Sample runs never touch the resume log: their truncated batch list
+    // would misalign batch indices with a full run's log. The persistent
+    // cache makes re-running a sample nearly free anyway.
+    let log_path = (!opts.sample).then(|| {
+        let key = resume_key(
+            &book_ref.lock().unwrap(),
+            &opts.model,
+            &opts.target_lang,
+            &opts.custom_instructions,
+        );
+        let p = data_dir.join("jobs").join(format!("{key}.jsonl"));
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        p
+    });
 
     // Reuse translations from a previous interrupted run, if any.
-    let resumed = load_resume(&log_path);
-    {
+    let resumed = log_path.as_ref().map(load_resume).unwrap_or_default();    {
         let mut book = book_ref.lock().unwrap();
         let docs = match &mut book.source {
             BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
@@ -397,9 +596,12 @@ async fn run_inner(
         .map(|bi| batches[bi].chars)
         .sum();
 
-    let resume_file = OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let resume_writer = Arc::new(Mutex::new(Some(resume_file)));
-    let client = Arc::new(GeminiClient::new(api_key, &opts.model));
+    let resume_file = match &log_path {
+        Some(p) => Some(OpenOptions::new().create(true).append(true).open(p)?),
+        None => None,
+    };
+    let resume_writer = Arc::new(Mutex::new(resume_file));
+    let pool = Arc::new(ClientPool::new(api_key, &opts.model, auto_switch, usage.clone()));
     let limiter = Arc::new(crate::gemini::RateLimiter::new(crate::gemini::model_rpm(
         &opts.model,
     )));
@@ -413,11 +615,43 @@ async fn run_inner(
         failed: Mutex::new(0),
         chars_done: Mutex::new(chars_start),
         tokens: AtomicU64::new(0),
+        sample: opts.sample,
+        cached_segments: AtomicUsize::new(0),
+        model: opts.model.clone(),
+        target_lang: opts.target_lang.clone(),
+        mode: opts.mode.clone(),
         snapshot_slot: snapshot_slot.clone(),
     });
     *ctx_slot.lock().unwrap() = Some(ctx.clone());
 
-    if pending.is_empty() && !resumed.is_empty() {
+    // Surface rate-limit pauses in the Activity log so a slow, throttled
+    // job never looks frozen.
+    limiter.set_wait_logger(Arc::new({
+        let ctx = ctx.clone();
+        move |d| {
+            ctx.log(format!(
+                "Rate limited — pausing {}s before the next request",
+                d.as_secs().max(1)
+            ))
+        }
+    }));
+
+    // If today's run already killed the starting model, start on a fallback
+    // instead of paying a 429 to rediscover that.
+    if let Some(next) = pool.skip_exhausted_current() {
+        ctx.log(format!(
+            "{} is exhausted for today — starting with {next}",
+            opts.model
+        ));
+    }
+
+    if opts.sample {
+        let items: usize = batches.iter().map(|b| b.items.len()).sum();
+        ctx.log(format!(
+            "Sampling the first {items} paragraphs into {} with {}",
+            opts.target_lang, opts.model
+        ));
+    } else if pending.is_empty() && !resumed.is_empty() {
         ctx.log("All batches already translated — resuming from cache.");
     } else if !pending.is_empty() {
         let rpm = crate::gemini::model_rpm(&opts.model);
@@ -452,8 +686,9 @@ async fn run_inner(
         for _ in 0..CONCURRENCY {
             workers.push(tokio::spawn(worker_loop(
                 rx.clone(),
-                client.clone(),
+                pool.clone(),
                 limiter.clone(),
+                seg_cache.clone(),
                 book_ref.clone(),
                 batches.clone(),
                 opts.clone(),
@@ -472,6 +707,13 @@ async fn run_inner(
                 *fatal.lock().unwrap() = Some("a worker task crashed".into());
             }
         }
+    }
+
+    let cached = ctx.cached_segments.load(Ordering::Relaxed);
+    if cached > 0 {
+        ctx.log(format!(
+            "{cached} paragraphs reused from the translation cache — no requests spent."
+        ));
     }
 
     if let Some(err) = fatal.lock().unwrap().take() {
@@ -553,8 +795,9 @@ async fn run_inner(
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<usize>>>,
-    client: Arc<GeminiClient>,
+    pool: Arc<ClientPool>,
     limiter: Arc<crate::gemini::RateLimiter>,
+    cache: SegmentCache,
     book_ref: Arc<Mutex<LoadedBook>>,
     batches: Vec<Batch>,
     opts: JobOptions,
@@ -576,8 +819,9 @@ async fn worker_loop(
         }
 
         let outcome = translate_batch_items(
-            client.clone(),
+            pool.clone(),
             limiter.clone(),
+            cache.clone(),
             opts.clone(),
             book_ref.clone(),
             bi,
@@ -616,11 +860,13 @@ enum BatchOutcome {
 
 /// Translate one full batch, keeping its resume entry all-or-nothing: the
 /// union map only reaches the resume log when every item translated, so a
-/// replayed batch is always fully covered.
+/// replayed batch is always fully covered. Segments already in the
+/// persistent cache are applied without spending a request.
 #[allow(clippy::too_many_arguments)]
 async fn translate_batch_items(
-    client: Arc<GeminiClient>,
+    pool: Arc<ClientPool>,
     limiter: Arc<crate::gemini::RateLimiter>,
+    cache: SegmentCache,
     opts: JobOptions,
     book: BookRef,
     bi: usize,
@@ -631,13 +877,55 @@ async fn translate_batch_items(
     resume_writer: Arc<Mutex<Option<File>>>,
 ) -> BatchOutcome {
     let mut union: BTreeMap<usize, String> = BTreeMap::new();
+
+    // Partition first: cache hits cost nothing, misses go to the API.
+    let (client, model) = pool.pair();
+    let mut fresh: Vec<BatchItem> = Vec::with_capacity(batch.items.len());
+    let mut positions: Vec<usize> = Vec::with_capacity(batch.items.len());
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for (k, item) in batch.items.iter().enumerate() {
+        match cache.lookup(&model, &item.text) {
+            Some(t) => hits.push((k, t)),
+            None => {
+                fresh.push(item.clone());
+                positions.push(k);
+            }
+        }
+    }
+    if !hits.is_empty() {
+        let hit_chars: usize = hits
+            .iter()
+            .map(|(k, _)| batch.items[*k].text.chars().count())
+            .sum();
+        {
+            let mut book = book.lock().unwrap();
+            let docs = match &mut book.source {
+                BookSource::Epub { docs, .. } | BookSource::Pdf { docs, .. } => docs,
+            };
+            for (k, t) in &hits {
+                apply_translation(docs, &batch.items[*k], t);
+            }
+        }
+        *ctx.chars_done.lock().unwrap() += hit_chars;
+        ctx.cached_segments
+            .fetch_add(hits.len(), Ordering::Relaxed);
+        for (k, t) in hits {
+            union.insert(k + 1, t);
+        }
+    }
+    if fresh.is_empty() {
+        return BatchOutcome::Done;
+    }
+    drop(client);
+
     let outcome = translate_items(
-        &client,
+        &pool,
         &limiter,
+        &cache,
         &opts,
         &book,
-        &batch.items,
-        0,
+        &fresh,
+        &positions,
         &format!("Batch {}", bi + 1),
         &cancel,
         &ctx,
@@ -651,17 +939,20 @@ async fn translate_batch_items(
     outcome
 }
 
-/// Translate a slice of batch items. Output-truncated requests are split in
-/// half and retried recursively — retrying the same oversized request would
-/// fail identically, while halves eventually fit.
+/// Translate a slice of batch items; `positions[j]` is item j's index in the
+/// parent batch, kept so resume coverage stays correct through recursive
+/// splits. Output-truncated requests are split in half and retried —
+/// retrying the same oversized request would fail identically, while halves
+/// eventually fit.
 #[allow(clippy::too_many_arguments)]
 async fn translate_items(
-    client: &GeminiClient,
+    pool: &ClientPool,
     limiter: &crate::gemini::RateLimiter,
+    cache: &SegmentCache,
     opts: &JobOptions,
     book: &BookRef,
     items: &[BatchItem],
-    offset: usize,
+    positions: &[usize],
     label: &str,
     cancel: &Arc<AtomicBool>,
     ctx: &ProgressCtx,
@@ -672,6 +963,7 @@ async fn translate_items(
         return BatchOutcome::Skipped;
     }
 
+    let (client, model) = pool.pair();
     limiter.acquire().await;
     let paras: Vec<(usize, String)> = items
         .iter()
@@ -697,12 +989,44 @@ async fn translate_items(
                 }
             }
             for (k, t) in &res.translations {
-                union.insert(offset + k, t.clone());
+                if let Some(item) = items.get(k - 1) {
+                    cache.record(&model, &item.text, t);
+                    if let Some(&pos) = positions.get(k - 1) {
+                        union.insert(pos + 1, t.clone());
+                    }
+                }
             }
             limiter.note_success();
             ctx.tokens.fetch_add(res.total_tokens, Ordering::Relaxed);
             *ctx.chars_done.lock().unwrap() += chars;
             BatchOutcome::Done
+        }
+        Err(GeminiFailure::QuotaExhausted(e, confirmed)) => {
+            // Only message-confirmed quota deaths go on the model's
+            // permanent record; a suspicious Retry-After alone must not ban
+            // a healthy model until tomorrow.
+            if confirmed {
+                pool.mark_exhausted(&model);
+            }
+            match pool.advance(&model) {
+                Some(next) => {
+                    ctx.log(format!("{e} — continuing with {next}"));
+                    Box::pin(translate_items(
+                        pool, limiter, cache, opts, book, items, positions, label, cancel, ctx,
+                        fatal, union,
+                    ))
+                    .await
+                }
+                None => {
+                    let msg = format!(
+                        "{e} and every fallback model — finished batches are saved; \
+                         resume tomorrow or use another API key"
+                    );
+                    *fatal.lock().unwrap() = Some(msg.clone());
+                    cancel.store(true, Ordering::SeqCst);
+                    BatchOutcome::Failed(msg)
+                }
+            }
         }
         Err(GeminiFailure::Fatal(e)) => {
             *fatal.lock().unwrap() = Some(e.to_string());
@@ -713,13 +1037,33 @@ async fn translate_items(
             ctx.log(format!("{label}: {e} — splitting into halves and retrying"));
             let mid = items.len() / 2;
             let first = Box::pin(translate_items(
-                client, limiter, opts, book, &items[..mid], offset, &format!("{label} (part 1)"),
-                cancel, ctx, fatal, union,
+                pool,
+                limiter,
+                cache,
+                opts,
+                book,
+                &items[..mid],
+                &positions[..mid],
+                &format!("{label} (part 1)"),
+                cancel,
+                ctx,
+                fatal,
+                union,
             ))
             .await;
             let second = Box::pin(translate_items(
-                client, limiter, opts, book, &items[mid..], offset + mid,
-                &format!("{label} (part 2)"), cancel, ctx, fatal, union,
+                pool,
+                limiter,
+                cache,
+                opts,
+                book,
+                &items[mid..],
+                &positions[mid..],
+                &format!("{label} (part 2)"),
+                cancel,
+                ctx,
+                fatal,
+                union,
             ))
             .await;
             match (first, second) {
@@ -834,6 +1178,92 @@ mod tests {
             .collect();
         assert_eq!(docs[0].blocks[1].translation.as_deref(), Some(expected.as_str()));
         assert!(docs[0].blocks[1].parts.is_empty());
+    }
+
+    #[test]
+    fn client_pool_walks_the_chain_until_empty() {
+        let usage = Arc::new(crate::usage::UsageTracker::open(std::env::temp_dir().join(format!(
+            "ebtr-pool-{}-a",
+            std::process::id()
+        ))));
+        let pool = ClientPool::new("key", "gemini-3.5-flash", true, usage);
+        assert_eq!(pool.pair().1, "gemini-3.5-flash");
+        assert_eq!(pool.advance("gemini-3.5-flash").as_deref(), Some("gemini-3.6-flash"));
+        // A stale worker reporting the old model just gets the current one.
+        assert_eq!(pool.advance("gemini-3.5-flash").as_deref(), Some("gemini-3.6-flash"));
+        assert_eq!(pool.advance("gemini-3.6-flash").as_deref(), Some("gemini-3.7-flash"));
+        assert_eq!(pool.advance("gemini-3.7-flash").as_deref(), Some("gemini-3.8-flash"));
+        // A model reported dead twice must not come back.
+        assert_eq!(pool.advance("gemini-3.8-flash"), None);
+        // Stale workers still just get the (exhausted) current model back;
+        // their next 429 on it reaches the dead end and stops the job.
+        assert_eq!(pool.advance("gemini-3.5-flash").as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(pool.pair().1, "gemini-3.8-flash"); // current unchanged at dead end
+    }
+
+    #[test]
+    fn client_pool_respects_disabled_switching() {
+        let usage = Arc::new(crate::usage::UsageTracker::open(std::env::temp_dir().join(format!(
+            "ebtr-pool-{}-b",
+            std::process::id()
+        ))));
+        let pool = ClientPool::new("key", "gemini-3.5-flash", false, usage);
+        assert_eq!(pool.advance("gemini-3.5-flash"), None);
+        assert_eq!(pool.pair().1, "gemini-3.5-flash");
+    }
+
+    #[test]
+    fn client_pool_skips_models_exhausted_earlier_today() {
+        let path = std::env::temp_dir().join(format!("ebtr-pool-{}-c", std::process::id()));
+        let usage = Arc::new(crate::usage::UsageTracker::open(path.clone()));
+        usage.mark_exhausted("gemini-3.5-flash");
+        let pool = ClientPool::new("key", "gemini-3.5-flash", true, usage.clone());
+        // The dead starting model is skipped up front, no 429 needed...
+        assert_eq!(pool.skip_exhausted_current().as_deref(), Some("gemini-3.6-flash"));
+        assert_eq!(pool.pair().1, "gemini-3.6-flash");
+        // ...and a fresh pool seeded with it exhausted does the same.
+        let pool2 = ClientPool::new("key", "gemini-3.5-flash", false, usage);
+        assert_eq!(pool2.skip_exhausted_current(), None); // switching off: no skip
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sample_truncation_keeps_a_prefix_of_items() {
+        let mk = |n: usize| Batch {
+            items: (0..n)
+                .map(|i| BatchItem {
+                    d: 0,
+                    b: i,
+                    part: None,
+                    text: format!("paragraph number {i} with words"),
+                })
+                .collect(),
+            chars: 0,
+            tokens: 0,
+        };
+        let batches = truncate_for_sample(vec![mk(10), mk(10), mk(10)], 25);
+        assert_eq!(batches.iter().map(|b| b.items.len()).sum::<usize>(), 25);
+        assert_eq!(batches[2].items.len(), 5);
+        // Truncated batches keep their counters consistent.
+        assert_eq!(
+            batches[2].chars,
+            batches[2]
+                .items
+                .iter()
+                .map(|i| i.text.chars().count())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            batches[2].tokens,
+            batches[2]
+                .items
+                .iter()
+                .map(|i| crate::gemini::estimate_tokens(&i.text))
+                .sum::<usize>()
+        );
+        // Below the cap nothing is trimmed.
+        let small = truncate_for_sample(vec![mk(4), mk(4)], 25);
+        assert_eq!(small.iter().map(|b| b.items.len()).sum::<usize>(), 8);
     }
 
     #[test]

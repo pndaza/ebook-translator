@@ -1,22 +1,36 @@
 <script lang="ts">
-  import { saveSettings, testApiKey, MODELS, MODEL_RATE_HINT, isDesktopApp } from "$lib/api";
+  import {
+    saveSettings,
+    testApiKey,
+    clearTranslationCache,
+    getCacheStats,
+    formatBytes,
+    DEFAULT_MODEL,
+    isDesktopApp,
+    type CacheStats,
+  } from "$lib/api";
   import { app } from "$lib/stores.svelte";
   import UpdaterSection from "$lib/components/UpdaterSection.svelte";
 
   let apiKey = $state("");
-  let model = $state("");
   let instructions = $state("");
+  let autoSwitch = $state(true);
   let testing = $state(false);
   let testResult = $state<{ ok: boolean; text: string } | null>(null);
   let savingState = $state(false);
   let modalEl: HTMLDivElement | null = $state(null);
+  let cacheStats = $state<CacheStats | null>(null);
+  let clearing = $state(false);
 
   $effect(() => {
     if (app.settingsOpen && app.settings) {
       apiKey = app.settings.apiKey;
-      model = app.settings.model;
       instructions = app.settings.customInstructions;
+      autoSwitch = app.settings.autoSwitchModel;
       testResult = null;
+      getCacheStats()
+        .then((s) => (cacheStats = s))
+        .catch(() => (cacheStats = null));
     }
   });
 
@@ -57,7 +71,7 @@
     testing = true;
     testResult = null;
     try {
-      const res = await testApiKey(apiKey, model);
+      const res = await testApiKey(apiKey, app.settings?.model || DEFAULT_MODEL);
       testResult = { ok: true, text: `${res.model} replied “${res.reply}” in ${res.latencyMs} ms` };
     } catch (e) {
       testResult = { ok: false, text: String(e) };
@@ -66,20 +80,33 @@
     }
   }
 
+  async function clearCache() {
+    clearing = true;
+    try {
+      cacheStats = await clearTranslationCache();
+    } catch (e) {
+      testResult = { ok: false, text: String(e) };
+    } finally {
+      clearing = false;
+    }
+  }
+
   async function saveAll() {
     savingState = true;
     try {
       await saveSettings({
         apiKey: apiKey.trim(),
-        model,
+        model: app.settings?.model ?? DEFAULT_MODEL, // last-used, set from the book card
         mode: app.form?.mode ?? "translated",
         customInstructions: instructions,
+        autoSwitchModel: autoSwitch,
       });
       app.settings = {
         apiKey: apiKey.trim(),
-        model,
+        model: app.settings?.model ?? DEFAULT_MODEL,
         mode: app.form?.mode ?? "translated",
         customInstructions: instructions,
+        autoSwitchModel: autoSwitch,
       };
       close();
     } catch (e) {
@@ -107,25 +134,17 @@
 
       <div class="field">
         <label for="key">Google AI Studio API key</label>
-        <input id="key" type="password" bind:value={apiKey} placeholder="AIza…" autocomplete="off" />
+        <div class="key-row">
+          <input id="key" type="password" bind:value={apiKey} placeholder="AIza…" autocomplete="off" />
+          <button class="btn btn-ghost test" onclick={test} disabled={testing || !apiKey.trim()}>
+            {testing ? "Testing…" : "Test key"}
+          </button>
+        </div>
         <p class="note">
           From <span class="mono">aistudio.google.com/apikey</span>. Stored only in this app's
           settings on your machine. Book text is sent to Google with storage disabled
           (<span class="mono">store: false</span>).
         </p>
-      </div>
-
-      <div class="field">
-        <label for="model">Default model</label>
-        <div class="model-row">
-          <select id="model" bind:value={model}>
-            {#each MODELS as m}<option value={m.id}>{m.label}</option>{/each}
-          </select>
-          <button class="btn btn-ghost test" onclick={test} disabled={testing || !apiKey.trim()}>
-            {testing ? "Testing…" : "Test key"}
-          </button>
-        </div>
-        <p class="rate-hint">{MODEL_RATE_HINT}</p>
       </div>
       {#if testResult}
         <p class="result" class:bad={!testResult.ok} role="status">{testResult.text}</p>
@@ -139,6 +158,31 @@
           bind:value={instructions}
           placeholder="e.g. Use formal register. Keep Pāli terms like “nibbāna” untranslated."></textarea>
         <p class="note">Appended to every request — glossary rules, tone, terms to keep as-is.</p>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" bind:checked={autoSwitch} />
+        <span>
+          Switch models automatically when the daily quota runs out
+          <span class="note">— continues with the next Flash model, whose quota is separate.</span>
+        </span>
+      </label>
+
+      <div class="field">
+        <span class="label">Translation cache</span>
+        <div class="cache-row">
+          <p class="note">
+            {cacheStats
+              ? `${cacheStats.entries.toLocaleString()} paragraphs · ${formatBytes(cacheStats.bytes)} — cached segments are reused instead of re-requested.`
+              : "Segments already translated once are reused instead of re-requested."}
+          </p>
+          <button
+            class="btn btn-ghost"
+            onclick={clearCache}
+            disabled={clearing || !cacheStats?.entries}>
+            {clearing ? "Clearing…" : "Clear"}
+          </button>
+        </div>
       </div>
 
       {#if isDesktopApp}
@@ -205,16 +249,35 @@
     color: var(--ink);
     background: var(--paper-dim);
   }
-  .model-row {
+  .key-row {
     display: flex;
     gap: 12px;
     align-items: center;
   }
-  .model-row select {
+  .key-row input {
     flex: 1;
   }
   .test {
     white-space: nowrap;
+  }
+  .cache-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .cache-row .note {
+    flex: 1;
+  }
+  .check {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 12.5px;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .check input {
+    margin: 0;
   }
   textarea {
     background: #fffdf7;
@@ -235,12 +298,6 @@
   .mono {
     font-family: var(--font-mono);
     font-size: 10.5px;
-  }
-  .rate-hint {
-    font-size: 11px;
-    line-height: 1.5;
-    color: var(--ink-soft);
-    white-space: pre-line;
   }
   .opt {
     font-weight: 400;

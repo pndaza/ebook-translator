@@ -1,14 +1,16 @@
 <script lang="ts">
   import { save } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-  import { cancelJob, saveOutput, formatChars } from "$lib/api";
+  import { cancelJob, saveOutput, startJob, formatChars } from "$lib/api";
   import { app, resetBook } from "$lib/stores.svelte";
 
   let saving = $state(false);
+  let startingFull = $state(false);
   let confirmDiscard = $state(false);
   let confirmEl: HTMLDivElement | null = $state(null);
 
   const progress = $derived(app.progress);
+  const sample = $derived(progress?.sample ?? false);
   const pct = $derived(
     progress && progress.charsTotal > 0
       ? Math.min(100, Math.round((progress.charsDone / progress.charsTotal) * 100))
@@ -18,7 +20,9 @@
   const running = $derived(progress?.status === "running");
   const headline = $derived(
     progress?.status === "completed"
-      ? "Done"
+      ? sample
+        ? "Sample ready"
+        : "Done"
       : progress?.status === "partial"
         ? "Done — with gaps"
         : progress?.status === "cancelled"
@@ -33,7 +37,7 @@
     const lang = app.jobLang || (app.form?.lang?.split(" (")[0] ?? "translation");
     const safeTitle = app.book.title.replace(/[\\/:*?"<>|]/g, "").trim() || "book";
     const path = await save({
-      defaultPath: `${safeTitle} (${lang}).epub`,
+      defaultPath: `${safeTitle} (${lang}${sample ? ", sample" : ""}).epub`,
       filters: [{ name: "EPUB", extensions: ["epub"] }],
     });
     if (!path) return;
@@ -48,14 +52,49 @@
     }
   }
 
+  // The sample's segments live in the translation cache, so the full run
+  // reuses them and only pays for the rest of the book. After a webview
+  // reload `lastOptions` is gone, so fall back to the progress snapshot's
+  // own job parameters.
+  async function translateFull() {
+    const fromSnapshot = progress
+      ? {
+          targetLang: progress.targetLang,
+          mode: progress.mode,
+          model: progress.model,
+          customInstructions: app.settings?.customInstructions ?? "",
+          sample: false,
+        }
+      : null;
+    const opts = app.lastOptions ?? fromSnapshot;
+    if (!opts) {
+      app.view = "ready";
+      return;
+    }
+    startingFull = true;
+    app.error = "";
+    try {
+      const full = { ...opts, sample: false };
+      await startJob(full);
+      app.lastOptions = full;
+      app.progress = null;
+      app.logs = [];
+      app.savedPath = "";
+    } catch (e) {
+      app.error = String(e);
+    } finally {
+      startingFull = false;
+    }
+  }
+
   async function reveal() {
     if (app.savedPath) await revealItemInDir(app.savedPath).catch(() => openPath(app.savedPath));
   }
 
   // Cancelling out of a finished job must never silently throw away an
-  // unsaved translation.
+  // unsaved translation. A finished sample is cheap to redo, though.
   function cancel() {
-    if (done && !app.savedPath) {
+    if (done && !sample && !app.savedPath) {
       confirmDiscard = true;
       return;
     }
@@ -90,13 +129,24 @@
     <header>
       <div>
         <p class="kind">
-          {done ? "Translated" : progress.status === "failed" ? "Translation failed" : "Translating"}
+          {done
+            ? sample
+              ? "Sample"
+              : "Translated"
+            : progress.status === "failed"
+              ? "Translation failed"
+              : sample
+                ? "Sampling"
+                : "Translating"}
           — {app.book?.title ?? ""}
         </p>
         <h2>{headline}</h2>
       </div>
       <div class="numbers">
         <span class="mono">{progress.batchesDone}/{progress.batchesTotal} batches</span>
+        {#if progress.cachedSegments}
+          <span class="mono">{progress.cachedSegments.toLocaleString()} from cache</span>
+        {/if}
         {#if progress.tokensUsed}
           <span class="mono">{progress.tokensUsed.toLocaleString()} tokens</span>
         {/if}
@@ -149,7 +199,27 @@
           <button class="btn btn-ghost" onclick={() => cancelJob()}>Pause</button>
         </div>
       {:else if done}
-        {#if app.savedPath}
+        {#if sample}
+          {#if app.savedPath}
+            <p class="saved">Saved to <span class="mono path">{app.savedPath}</span></p>
+          {:else}
+            <p class="hint">Everything the sample translated is reused when you run the full book.</p>
+          {/if}
+          <div class="btn-group">
+            {#if app.savedPath}
+              <button class="btn btn-ghost" onclick={reveal}>Show in Finder</button>
+              <button class="btn btn-ghost" onclick={resetBook}>Done</button>
+            {:else}
+              <button class="btn btn-ghost" onclick={cancel}>Cancel</button>
+              <button class="btn btn-ghost" onclick={saveEpub} disabled={saving}>
+                {saving ? "Saving…" : "Save sample"}
+              </button>
+            {/if}
+            <button class="btn btn-primary" onclick={translateFull} disabled={startingFull}>
+              {startingFull ? "Starting…" : "Translate full book"}
+            </button>
+          </div>
+        {:else if app.savedPath}
           <p class="saved">Saved to <span class="mono path">{app.savedPath}</span></p>
           <div class="btn-group">
             <button class="btn btn-ghost" onclick={reveal}>Show in Finder</button>

@@ -1,11 +1,15 @@
 <script lang="ts">
   import {
     startJob,
+    saveSettings,
     formatChars,
     estimateRequests,
+    getUsage,
     LANGUAGES,
     MODELS,
+    DEFAULT_MODEL,
     MODEL_RATE_HINT,
+    type UsageSnapshot,
   } from "$lib/api";
   import { app, resetBook } from "$lib/stores.svelte";
 
@@ -18,7 +22,7 @@
   const seeded = app.form ?? {
     lang: LANGUAGES[0],
     mode: "translated",
-    model: app.settings?.model || "gemini-3.5-flash-lite",
+    model: app.settings?.model || DEFAULT_MODEL,
   };
   // The language picker offers two options; anything left over from an older
   // default (or a free-typed settings value) falls back to Burmese.
@@ -31,16 +35,47 @@
   let model = $state(seeded.model);
   let starting = $state(false);
   let requests = $state<number | null>(null);
+  let cachedBatches = $state(0);
+  let usage = $state<UsageSnapshot | null>(null);
 
-  // Re-run the real batcher for the loaded book whenever the model changes.
+  // Today's usage for the selected model, fetched once per card visit.
+  $effect(() => {
+    getUsage()
+      .then((u) => (usage = u))
+      .catch(() => (usage = null));
+  });
+
+  const usageLine = $derived.by(() => {
+    if (!usage) return null;
+    const reset = new Date(usage.resetAt * 1000).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const m = usage.models[model];
+    if (m?.exhausted) return `quota exhausted for today — resets ${reset}`;
+    if (m && m.requests > 0)
+      return `${m.requests} request${m.requests === 1 ? "" : "s"} on this model today · resets ${reset}`;
+    return `daily quota resets ${reset}`;
+  });
+
+  // Re-run the real batcher whenever the model, language, or instructions
+  // change — the cache is keyed by all three, so the estimate must be too.
   $effect(() => {
     const m = model;
-    estimateRequests(m)
-      .then((n) => {
-        if (m === model) requests = n;
+    const l = lang;
+    const instr = app.settings?.customInstructions ?? "";
+    estimateRequests(m, l, instr)
+      .then((r) => {
+        if (m === model && l === lang && instr === (app.settings?.customInstructions ?? "")) {
+          requests = r?.requests ?? null;
+          cachedBatches = r?.cachedBatches ?? 0;
+        }
       })
       .catch(() => {
-        if (m === model) requests = null;
+        if (m === model) {
+          requests = null;
+          cachedBatches = 0;
+        }
       });
   });
 
@@ -48,17 +83,26 @@
     app.form = { lang, mode, model };
   });
 
-  async function begin() {
+  async function begin(sample: boolean) {
     if (!app.book) return;
     starting = true;
     app.error = "";
+    // The card is the only model picker now; remember the choice so the
+    // next book (and the Test-key ping) starts from it.
+    if (app.settings && app.settings.model !== model) {
+      app.settings.model = model;
+      saveSettings(app.settings).catch(() => {});
+    }
+    const options = {
+      targetLang: lang,
+      mode,
+      model,
+      customInstructions: app.settings?.customInstructions ?? "",
+      sample,
+    };
     try {
-      await startJob({
-        targetLang: lang,
-        mode,
-        model,
-        customInstructions: app.settings?.customInstructions ?? "",
-      });
+      await startJob(options);
+      app.lastOptions = options;
       // Drop the previous run's card so the new one starts clean.
       app.progress = null;
       app.logs = [];
@@ -118,7 +162,14 @@
           </select>
           <p class="rate-hint">{MODEL_RATE_HINT}</p>
           {#if requests !== null}
-            <p class="estimate">≈ {requests} requests for this book</p>
+            <p class="estimate">
+              ≈ {requests} requests for this book{cachedBatches
+                ? ` · ${cachedBatches} ${cachedBatches === 1 ? "batch" : "batches"} from cache`
+                : ""}
+            </p>
+          {/if}
+          {#if usageLine}
+            <p class="rate-hint">{usageLine}</p>
           {/if}
         </div>
 
@@ -158,7 +209,17 @@
       {/if}
       <div class="btn-group">
         <button class="btn btn-ghost" disabled={starting} onclick={resetBook}>Cancel</button>
-        <button class="btn btn-primary" disabled={noKey || starting || !lang.trim()} onclick={begin}>
+        <button
+          class="btn btn-ghost"
+          title="Translate the opening pages first to preview the result"
+          disabled={noKey || starting || !lang.trim()}
+          onclick={() => begin(true)}>
+          Sample first
+        </button>
+        <button
+          class="btn btn-primary"
+          disabled={noKey || starting || !lang.trim()}
+          onclick={() => begin(false)}>
           {starting ? "Starting…" : `Translate to ${lang.split(" (")[0]}`}
         </button>
       </div>

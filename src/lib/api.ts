@@ -11,6 +11,7 @@ export interface Settings {
   model: string;
   mode: string;
   customInstructions: string;
+  autoSwitchModel: boolean;
 }
 
 export interface SegmentInfo {
@@ -37,6 +38,7 @@ export interface JobOptions {
   mode: string;
   model: string;
   customInstructions: string;
+  sample: boolean;
 }
 
 export interface SegmentStatus {
@@ -58,7 +60,44 @@ export interface JobProgress {
   tokensUsed: number;
   error: string | null;
   outputReady: boolean;
+  sample: boolean;
+  cachedSegments: number;
+  model: string;
+  targetLang: string;
+  mode: string;
 }
+
+export interface EstimateResult {
+  requests: number;
+  cachedBatches: number;
+}
+
+export interface CacheStats {
+  entries: number;
+  bytes: number;
+}
+
+export interface ModelUsage {
+  requests: number;
+  exhausted: boolean;
+}
+
+export interface UsageSnapshot {
+  /** Epoch seconds of the next daily quota reset (08:00 UTC). */
+  resetAt: number;
+  models: Record<string, ModelUsage>;
+}
+
+export const getUsage = (): Promise<UsageSnapshot> =>
+  inTauri
+    ? invoke<UsageSnapshot>("get_usage")
+    : Promise.resolve({
+        resetAt: Math.floor(Date.now() / 1000) + 3600,
+        models: {
+          "gemini-3.5-flash-lite": { requests: 143, exhausted: false },
+          "gemini-3.5-flash": { requests: 12, exhausted: true },
+        },
+      });
 
 export interface TestKeyResult {
   reply: string;
@@ -79,6 +118,7 @@ export const getSettings = () =>
         model: "gemini-3.5-flash-lite",
         mode: "translated",
         customInstructions: "",
+        autoSwitchModel: true,
       } as Settings);
 
 export const saveSettings = (settings: Settings) =>
@@ -120,6 +160,8 @@ let previewProgressCb: ProgressCb | null = null;
 let previewLogCb: ((msg: string) => void) | null = null;
 let previewTimer: ReturnType<typeof setInterval> | null = null;
 let previewTick = 0;
+let previewSample = false;
+let previewOptions: JobOptions | null = null;
 
 function previewStop() {
   if (previewTimer) {
@@ -129,6 +171,8 @@ function previewStop() {
 }
 
 function previewSnap(doneSeg: number, i: number, status: JobProgress["status"]): JobProgress {
+  const totalBatches = previewSample ? 3 : 48;
+  const totalChars = previewSample ? 3_000 : 118_400;
   return {
     status,
     segments: fixtureBook.segments.map((s, idx) => ({
@@ -144,7 +188,9 @@ function previewSnap(doneSeg: number, i: number, status: JobProgress["status"]):
               : "pending",
       done:
         status === "completed"
-          ? s.blocks
+          ? previewSample
+            ? Math.ceil(s.blocks / 10)
+            : s.blocks
           : idx < doneSeg - 1
             ? s.blocks
             : idx === doneSeg - 1
@@ -152,22 +198,28 @@ function previewSnap(doneSeg: number, i: number, status: JobProgress["status"]):
               : 0,
       total: s.blocks,
     })),
-    batchesTotal: 48,
-    batchesDone: status === "completed" ? 48 : Math.min(48, i * 3),
+    batchesTotal: totalBatches,
+    batchesDone: status === "completed" ? totalBatches : Math.min(totalBatches, i * 3),
     batchesFailed: 0,
-    charsDone: status === "completed" ? 118_400 : Math.min(118_400, i * 7_400),
-    charsTotal: 118_400,
+    charsDone: status === "completed" ? totalChars : Math.min(totalChars, i * 7_400),
+    charsTotal: totalChars,
     tokensUsed: i * 2_300,
     error: null,
     outputReady: status === "completed",
+    sample: previewSample,
+    cachedSegments: 0,
+    model: previewOptions?.model ?? "gemini-3.5-flash-lite",
+    targetLang: previewOptions?.targetLang ?? "Burmese (မြန်မာ)",
+    mode: previewOptions?.mode ?? "translated",
   };
 }
 
 function previewFire() {
   const i = previewTick++;
-  if (i > 16) {
-    previewProgressCb?.(previewSnap(5, i, "completed"));
-    if (i > 17) previewStop();
+  const doneAt = previewSample ? 2 : 16;
+  if (i > doneAt) {
+    previewProgressCb?.(previewSnap(previewSample ? 1 : 5, i, "completed"));
+    if (i > doneAt + 1) previewStop();
   } else {
     previewProgressCb?.(previewSnap(Math.min(5, 1 + Math.floor(i / 3)), i, "running"));
     if (i % 4 === 0) previewLogCb?.(`Translated batches ${i * 3 + 1}–${i * 3 + 3}`);
@@ -178,7 +230,11 @@ export const startJob = (options: JobOptions) => {
   if (inTauri) return invoke<void>("start_job", { options });
   previewStop();
   previewTick = 0;
-  previewLogCb?.(`Translating into ${options.targetLang} with ${options.model} (preview)`);
+  previewSample = options.sample;
+  previewOptions = options;
+  previewLogCb?.(
+    `${previewSample ? "Sampling" : "Translating"} into ${options.targetLang} with ${options.model} (preview)`,
+  );
   previewTimer = setInterval(previewFire, 400);
   return Promise.resolve();
 };
@@ -201,13 +257,34 @@ export const getCurrentBook = (): Promise<BookInfo | null> =>
 export const getJobProgress = (): Promise<JobProgress | null> =>
   inTauri ? invoke<JobProgress | null>("get_job_progress") : Promise.resolve(null);
 
-export const estimateRequests = (model: string): Promise<number | null> => {
-  if (inTauri) return invoke<number | null>("estimate_requests", { model });
+export const estimateRequests = (
+  model: string,
+  targetLang: string,
+  customInstructions: string,
+): Promise<EstimateResult | null> => {
+  if (inTauri) {
+    return invoke<EstimateResult | null>("estimate_requests", {
+      model,
+      targetLang,
+      customInstructions,
+    });
+  }
   // Browser preview: approximate with the calibrated token estimator.
   const budget = model.includes("lite") ? 5_000 : 10_000;
   const tokens = Math.ceil(fixtureBook.totalChars / 2.3);
-  return Promise.resolve(Math.max(1, Math.ceil(tokens / budget)));
+  return Promise.resolve({
+    requests: Math.max(1, Math.ceil(tokens / budget)),
+    cachedBatches: 0,
+  });
 };
+
+export const getCacheStats = (): Promise<CacheStats> =>
+  inTauri
+    ? invoke<CacheStats>("cache_stats")
+    : Promise.resolve({ entries: 1286, bytes: 2_418_000 });
+
+export const clearTranslationCache = (): Promise<CacheStats> =>
+  inTauri ? invoke<CacheStats>("clear_cache") : Promise.resolve({ entries: 0, bytes: 0 });
 
 export function onJobProgress(cb: ProgressCb): Promise<UnlistenFn> {
   if (inTauri) return listen<JobProgress>("job-progress", (e) => cb(e.payload));
@@ -227,8 +304,11 @@ export function onJobLog(cb: (msg: string) => void): Promise<UnlistenFn> {
 
 export const LANGUAGES = ["Burmese (မြန်မာ)", "English"];
 
+export const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+
 export const MODELS = [
   { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite" },
+  { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite" },
   { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
   { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
   { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash" },
@@ -242,4 +322,10 @@ export function formatChars(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M chars`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}k chars`;
   return `${n} chars`;
+}
+
+export function formatBytes(n: number): string {
+  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
+  if (n >= 1_024) return `${Math.round(n / 1_024)} KB`;
+  return `${n} B`;
 }

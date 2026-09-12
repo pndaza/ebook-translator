@@ -1,6 +1,7 @@
 use crate::error::{AppError, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/interactions";
@@ -8,6 +9,32 @@ const MAX_ATTEMPTS: u32 = 5;
 /// 429s are expected on the free tier: allow many more of them, with longer
 /// delays sized to outlast the per-minute rate window.
 const MAX_RATE_HITS: u32 = 12;
+/// Never sleep longer than this on a 429, whatever Retry-After claims.
+const MAX_RATE_LIMIT_WAIT_SECS: u64 = 120;
+
+/// What a 429 means: a per-minute rate limit (back off, retry soon) or the
+/// daily quota being gone (retrying is pointless for hours — fail the job).
+enum FourTwentyNine {
+    RateLimit,
+    /// The message itself names a per-day quota: high confidence.
+    DailyConfirmed,
+    /// Only a Retry-After far beyond any RPM window hints at it.
+    DailySuspected,
+}
+
+fn classify_429(message: &str, retry_after: Option<u64>) -> FourTwentyNine {
+    let m = message.to_lowercase();
+    if m.contains("per day") || m.contains("perday") {
+        return FourTwentyNine::DailyConfirmed;
+    }
+    // RPM windows are at most a minute; a Retry-After beyond this is
+    // probably the daily quota talking — but treat it as unconfirmed so one
+    // weird header cannot get a healthy model banned for the whole day.
+    if retry_after.is_some_and(|s| s > 600) {
+        return FourTwentyNine::DailySuspected;
+    }
+    FourTwentyNine::RateLimit
+}
 
 fn rate_limit_delay(hits: u32) -> Duration {
     Duration::from_secs((5 * hits as u64).min(30))
@@ -60,8 +87,13 @@ struct LimiterState {
 /// the model's free-tier rate limit. When the API still answers 429, the
 /// limiter slows the whole job down (see [`RateLimiter::penalize`]) so every
 /// worker backs off together instead of each burning retries.
+/// Callback fired whenever the limiter pauses the job, so the UI can show
+/// why progress stalled.
+type WaitLogger = Arc<dyn Fn(Duration) + Send + Sync>;
+
 pub struct RateLimiter {
     state: std::sync::Mutex<LimiterState>,
+    on_wait: std::sync::Mutex<Option<WaitLogger>>,
 }
 
 impl RateLimiter {
@@ -74,7 +106,12 @@ impl RateLimiter {
                 next_start: None,
                 streak: 0,
             }),
+            on_wait: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn set_wait_logger(&self, f: WaitLogger) {
+        *self.on_wait.lock().unwrap() = Some(f);
     }
 
     pub async fn acquire(&self) {
@@ -103,6 +140,10 @@ impl RateLimiter {
             .checked_add(cooldown)
             .unwrap_or_else(Instant::now);
         st.next_start = Some(st.next_start.map_or(target, |t| t.max(target)));
+        drop(st);
+        if let Some(log) = self.on_wait.lock().unwrap().as_ref() {
+            log(cooldown);
+        }
     }
 
     /// Called after a clean request: once the job has been running without a
@@ -128,6 +169,9 @@ pub struct GeminiClient {
     http: reqwest::Client,
     api_key: String,
     model: String,
+    /// Optional daily-usage counter; every 2xx translation request is
+    /// recorded against the model.
+    usage: Option<Arc<crate::usage::UsageTracker>>,
 }
 
 pub struct BatchResult {
@@ -144,13 +188,48 @@ pub enum GeminiFailure {
     /// The model hit an output limit mid-answer. Retrying the same request
     /// fails the same way — the caller should split the batch instead.
     Truncated(AppError),
+    /// The model's free-tier daily quota is gone. Not fatal on its own: the
+    /// job may continue on a fallback model with its own separate quota.
+    /// The flag marks quota confirmed by the error message (vs. only
+    /// suspected from a long Retry-After), so persistent bookkeeping only
+    /// records the sure cases.
+    QuotaExhausted(AppError, bool),
 }
 
 impl GeminiFailure {
     pub fn message(&self) -> String {
         match self {
-            Self::Fatal(e) | Self::Exhausted(e) | Self::Truncated(e) => e.to_string(),
+            Self::Fatal(e) | Self::Exhausted(e) | Self::Truncated(e) | Self::QuotaExhausted(e, _) => {
+                e.to_string()
+            }
         }
+    }
+}
+
+/// Same-tier models to fall back to when the current one's daily quota dies,
+/// ordered starting right after `model`. Free-tier quotas are per model, so
+/// each switch buys a fresh daily budget. Keep in sync with MODELS in
+/// src/lib/api.ts.
+pub fn fallback_models(model: &str) -> Vec<String> {
+    const FLASH: [&str; 4] = [
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+    ];
+    const LITE: [&str; 2] = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+    let chain: &[&str] = if model.contains("lite") { &LITE } else { &FLASH };
+    let at = chain.iter().position(|m| *m == model);
+    match at {
+        Some(i) => chain
+            .iter()
+            .cycle()
+            .skip(i + 1)
+            .take(chain.len() - 1)
+            .map(|m| m.to_string())
+            .collect(),
+        // Custom model ID: offer the whole same-tier chain.
+        None => chain.iter().map(|m| m.to_string()).collect(),
     }
 }
 
@@ -179,6 +258,14 @@ fn check_output_status(value: &Value) -> std::result::Result<(), AppError> {
 
 impl GeminiClient {
     pub fn new(api_key: &str, model: &str) -> Self {
+        Self::with_usage(api_key, model, None)
+    }
+
+    pub fn with_usage(
+        api_key: &str,
+        model: &str,
+        usage: Option<Arc<crate::usage::UsageTracker>>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(180))
             .connect_timeout(Duration::from_secs(20))
@@ -188,6 +275,7 @@ impl GeminiClient {
             http,
             api_key: api_key.to_string(),
             model: model.to_string(),
+            usage,
         }
     }
 
@@ -273,7 +361,10 @@ impl GeminiClient {
             "You are a professional literary translator. You translate numbered text \
 paragraphs into {lang}.\n\
 Rules:\n\
-- Translate faithfully, preserving meaning, tone, and register.\n\
+- Translate naturally and idiomatically: render the meaning in fluent {lang} the way a \
+native writer would express it. Do NOT translate literally or word-for-word — rephrase \
+freely whenever a literal rendering would read awkwardly.\n\
+- Preserve the tone and register of the original (formal stays formal, casual stays casual).\n\
 - Keep paragraph numbering exact: return the same \"i\" values you were given.\n\
 - Never merge, split, add, omit, or reorder paragraphs.\n\
 - Preserve proper nouns, numbers, URLs, and code snippets; transliterate names only \
@@ -334,15 +425,31 @@ when customary in {lang}.\n\
             };
 
             if status.as_u16() == 429 {
+                let err = Self::api_error(status, &value);
+                let quota = match classify_429(&err.to_string(), retry_after) {
+                    FourTwentyNine::RateLimit => None,
+                    FourTwentyNine::DailyConfirmed => Some(true),
+                    FourTwentyNine::DailySuspected => Some(false),
+                };
+                if let Some(confirmed) = quota {
+                    return Err(GeminiFailure::QuotaExhausted(
+                        AppError::msg(format!(
+                            "the free-tier daily quota for {} is exhausted",
+                            self.model
+                        )),
+                        confirmed,
+                    ));
+                }
                 rate_hits += 1;
-                // Prefer the server's Retry-After; otherwise assume we blew
-                // the sliding RPM window and wait out a share of a minute.
+                // Prefer the server's Retry-After, capped so one bad header
+                // can never freeze the job; otherwise assume we blew the
+                // sliding RPM window and wait out a share of a minute.
                 let cooldown = retry_after
                     .filter(|s| *s > 0)
-                    .map(Duration::from_secs)
+                    .map(|s| Duration::from_secs(s.min(MAX_RATE_LIMIT_WAIT_SECS)))
                     .unwrap_or_else(|| rate_limit_delay(rate_hits));
                 limiter.penalize(cooldown);
-                last_err = Some(Self::api_error(status, &value));
+                last_err = Some(err);
                 tokio::time::sleep(cooldown).await;
                 continue;
             }
@@ -354,6 +461,11 @@ when customary in {lang}.\n\
             }
             if !status.is_success() {
                 return Err(GeminiFailure::Fatal(Self::api_error(status, &value)));
+            }
+            // The request is behind us and it counted against today's quota
+            // even if the output below needs retrying.
+            if let Some(usage) = &self.usage {
+                usage.record_request(&self.model);
             }
             check_output_status(&value).map_err(GeminiFailure::Truncated)?;
 
@@ -476,6 +588,61 @@ pub fn parse_translations(text: &str) -> Result<BTreeMap<usize, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_chain_stays_in_tier_and_rotates() {
+        assert_eq!(
+            crate::gemini::fallback_models("gemini-3.5-flash"),
+            ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]
+        );
+        // Rotation starts right after the current model.
+        assert_eq!(
+            crate::gemini::fallback_models("gemini-3.7-flash"),
+            ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.6-flash"]
+        );
+        assert_eq!(
+            crate::gemini::fallback_models("gemini-3.5-flash-lite"),
+            ["gemini-3.1-flash-lite"]
+        );
+        // A custom ID gets the whole same-tier chain.
+        assert_eq!(fallback_models("my-own-model").len(), 4);
+        assert_eq!(fallback_models("my-own-lite-model").len(), 2);
+    }
+
+    #[test]
+    fn classifies_rate_limit_vs_daily_quota() {
+        use FourTwentyNine::{DailyConfirmed, DailySuspected, RateLimit};
+        // Per-minute rate limits: retry soon.
+        assert!(matches!(
+            classify_429("Rate of requests exceeded GenerateRequestsPerMinutePerProject", Some(30)),
+            RateLimit
+        ));
+        assert!(matches!(classify_429("resource exhausted", None), RateLimit));
+        // Daily quota confirmed by the message itself.
+        assert!(matches!(
+            classify_429("Quota exceeded GenerateRequestsPerDayPerProject_FreeTier", Some(1)),
+            DailyConfirmed
+        ));
+        assert!(matches!(
+            classify_429("You exceeded your quota of 200 requests per day", None),
+            DailyConfirmed
+        ));
+        // A Retry-After far beyond any RPM window is only suspected.
+        assert!(matches!(classify_429("resource exhausted", Some(1800)), DailySuspected));
+    }
+
+    #[test]
+    fn penalize_reports_wait_to_logger() {
+        let l = RateLimiter::new(60);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let seen = seen.clone();
+            Arc::new(move |d: Duration| seen.lock().unwrap().push(d))
+        };
+        l.set_wait_logger(sink);
+        l.penalize(Duration::from_secs(45));
+        assert_eq!(seen.lock().unwrap().clone(), vec![Duration::from_secs(45)]);
+    }
 
     #[test]
     fn extracts_text_from_interactions_response() {

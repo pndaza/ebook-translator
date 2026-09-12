@@ -1,5 +1,6 @@
 use crate::error::{AppError, Result};
 use crate::types::{Block, BookInfo, ContentDoc, LoadedBook, SegmentInfo};
+use std::collections::HashMap;
 
 const CHAPTER_CHAR_TARGET: usize = 8000;
 
@@ -9,6 +10,274 @@ pub fn is_pdf(bytes: &[u8]) -> bool {
 
 fn qualify(text: &str) -> bool {
     crate::types::is_translatable(text)
+}
+
+// ---------------------------------------------------------------------------
+// Page furniture: running headers/footers and page numbers.
+//
+// PDF text extraction interleaves them with the prose, wasting requests and
+// littering the translation with repeated titles. A line at a page edge is
+// furniture when it is nothing but a page number, or when the same text
+// (minus its page number) recurs at that edge on several pages — which also
+// catches the classic verso-title / recto-chapter alternation.
+// ---------------------------------------------------------------------------
+
+/// A running line must recur at the same page edge this often to count as
+/// furniture, so genuine one-off headings survive.
+const FURNITURE_MIN_PAGES: usize = 3;
+
+fn to_roman(mut n: u32) -> String {
+    const PAIRS: [(&str, u32); 13] = [
+        ("m", 1000),
+        ("cm", 900),
+        ("d", 500),
+        ("cd", 400),
+        ("c", 100),
+        ("xc", 90),
+        ("l", 50),
+        ("xl", 40),
+        ("x", 10),
+        ("ix", 9),
+        ("v", 5),
+        ("iv", 4),
+        ("i", 1),
+    ];
+    let mut out = String::new();
+    for (sym, val) in PAIRS {
+        while n >= val {
+            out.push_str(sym);
+            n -= val;
+        }
+    }
+    out
+}
+
+/// Strictly parse a lowercase roman numeral (round-trip valid), so real
+/// words like "civil" or "mill" never masquerade as page numbers.
+fn roman_value(s: &str) -> Option<u32> {
+    let val = |c: char| {
+        Some(match c {
+            'i' => 1,
+            'v' => 5,
+            'x' => 10,
+            'l' => 50,
+            'c' => 100,
+            'd' => 500,
+            'm' => 1000,
+            _ => return None,
+        })
+    };
+    let mut total = 0u32;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let v = val(c)?;
+        match chars.peek().copied() {
+            Some(n) => {
+                let nv = val(n)?;
+                if nv > v {
+                    // Subtractive pairs only: iv, ix, xl, xc, cd, cm.
+                    if !matches!(
+                        (c, n),
+                        ('i', 'v') | ('i', 'x') | ('x', 'l') | ('x', 'c') | ('c', 'd') | ('c', 'm')
+                    ) {
+                        return None;
+                    }
+                    total += nv - v;
+                    chars.next();
+                } else {
+                    total += v;
+                }
+            }
+            None => total += v,
+        }
+    }
+    if s.is_empty() || total == 0 || total >= 4000 {
+        return None;
+    }
+    (to_roman(total) == s).then_some(total)
+}
+
+/// Lowercase words that would otherwise parse as page numbers — valid
+/// romans ("mix" = 1009) or digit-free OCR readings ("oil" -> 011). Real
+/// text must never be furniture.
+const NOT_PAGE_NUMBERS: &[&str] = &[
+    "di", "mi", "ci", "li", "mix",
+    "lo", "yo", "jo", "ill", "oil", "oily", "lily", "joy", "lol", "loll", "jill", "yoyo",
+];
+
+/// A token that looks like a page number: real digits with common OCR
+/// misreads ("i6" = 16, "2o" = 20, "j6", "6y"), digit-free misreads ("ioo" =
+/// 100, "IOI" = 101), or a strict roman numeral — but never a real word.
+fn token_is_numberish(tok: &str) -> bool {
+    let lower = tok.to_lowercase();
+    if NOT_PAGE_NUMBERS.contains(&lower.as_str()) {
+        return false;
+    }
+    if tok.chars().any(|c| c.is_ascii_digit())
+        && tok.chars().all(|c| {
+            c.is_ascii_digit()
+                || matches!(c, 'i' | 'I' | 'l' | 'L' | 'o' | 'O' | 'j' | 'J' | 'y' | 'Y')
+                || "*<>,.-–—".contains(c)
+        })
+    {
+        return true;
+    }
+    // Digit-free OCR numbers: map the misreads and keep only plausible page
+    // numbers, so real words stay words ("jolly" -> 10117 is rejected by the
+    // length cap alone).
+    let mapped: String = tok
+        .chars()
+        .filter(|c| !"*<>,.-–—".contains(*c))
+        .map(|c| match c {
+            'i' | 'I' | 'l' | 'L' | 'j' | 'J' => '1',
+            'o' | 'O' => '0',
+            'y' | 'Y' => '7',
+            other => other,
+        })
+        .collect();
+    if (2..=4).contains(&mapped.chars().count())
+        && mapped.chars().all(|c| c.is_ascii_digit())
+        && mapped.parse::<u32>().is_ok_and(|n| n > 0)
+    {
+        return true;
+    }
+    // A lone "i" stays peeling-eligible ("Background 4 i" = 41); a whole
+    // line of "i" is too rare to worry about.
+    roman_value(&lower).is_some()
+}
+
+/// A whole line that is nothing but a page number: bare digits (with OCR
+/// noise) or a roman numeral, optionally prefixed with "page"/"p." and
+/// wrapped in dashes, brackets, or dots.
+fn is_page_number(line: &str) -> bool {
+    let lower = line.trim().to_lowercase();
+    let core = ["page ", "page, ", "p. ", "p "]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))
+        .unwrap_or(lower.as_str());
+    let compact: String = core.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.chars().count() > 10 {
+        return false;
+    }
+    let core: String = compact
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string();
+    token_is_numberish(&core)
+}
+
+/// Clustering key for an edge line: lowercase with leading/trailing
+/// number-ish tokens peeled, so "22 Early Buddhist Theory of Knowledge",
+/// "Early Buddhist Theory of Knowledge 4 i" and "<5  Foreword" all map to
+/// their running text. `None` for lines that are only a number.
+fn header_key(line: &str) -> Option<String> {
+    let mut toks: Vec<&str> = line.split_whitespace().collect();
+    for _ in 0..2 {
+        match toks.first() {
+            Some(t) if token_is_numberish(t) => {
+                toks.remove(0);
+            }
+            _ => break,
+        }
+    }
+    for _ in 0..2 {
+        match toks.last() {
+            Some(t) if token_is_numberish(t) => {
+                toks.pop();
+            }
+            _ => break,
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+    let key = toks.join(" ").to_lowercase();
+    (!key.is_empty()).then_some(key)
+}
+
+fn is_furniture(counts: &HashMap<String, usize>, line: &str) -> bool {
+    header_key(line).is_some_and(|key| {
+        counts.get(&key).is_some_and(|n| *n >= FURNITURE_MIN_PAGES)
+    })
+}
+
+/// Drop up to two furniture lines from one edge of a page (the first or
+/// last non-empty line), returning how many were removed. Bare page numbers
+/// are only stripped when the book actually paginates that way.
+fn strip_edge(
+    lines: &mut Vec<&str>,
+    top: bool,
+    counts: &HashMap<String, usize>,
+    strip_numbers: bool,
+) -> usize {
+    let mut stripped = 0usize;
+    for _ in 0..2 {
+        let idx = if top {
+            lines.iter().position(|l| !l.is_empty())
+        } else {
+            lines.iter().rposition(|l| !l.is_empty())
+        };
+        let Some(i) = idx else { break };
+        let line = lines[i];
+        if (strip_numbers && is_page_number(line)) || is_furniture(counts, line) {
+            lines.remove(i);
+            stripped += 1;
+        } else {
+            break;
+        }
+    }
+    stripped
+}
+
+/// Remove running headers/footers and page numbers from page edges, keeping
+/// blank lines (they carry the paragraph structure). Returns the cleaned
+/// pages and how many lines were dropped.
+fn strip_page_furniture(pages: &[String]) -> (Vec<String>, usize) {
+    // Trimmed lines per page, blanks kept; non-empty indices for edges.
+    let page_lines: Vec<Vec<&str>> = pages
+        .iter()
+        .map(|p| p.lines().map(str::trim).collect())
+        .collect();
+
+    let mut tops: HashMap<String, usize> = HashMap::new();
+    let mut bottoms: HashMap<String, usize> = HashMap::new();
+    let mut number_pages = 0usize;
+    for lines in &page_lines {
+        let non_empty: Vec<&&str> = lines.iter().filter(|l| !l.is_empty()).collect();
+        // Single-line pages are usually real title/divider pages, not
+        // furniture, and must not pollute the counts either.
+        if non_empty.len() < 2 {
+            continue;
+        }
+        if let Some(key) = header_key(non_empty[0]) {
+            *tops.entry(key).or_default() += 1;
+        }
+        if let Some(key) = header_key(non_empty[non_empty.len() - 1]) {
+            *bottoms.entry(key).or_default() += 1;
+        }
+        if non_empty.first().copied().is_some_and(|l| is_page_number(l))
+            || non_empty.last().copied().is_some_and(|l| is_page_number(l))
+        {
+            number_pages += 1;
+        }
+    }
+    // Page numbers appear on most numbered pages; a lone "II" chapter
+    // numeral or stray year is content, so strip bare numbers only when the
+    // pattern repeats like furniture does.
+    let strip_numbers = number_pages >= FURNITURE_MIN_PAGES || number_pages * 3 >= pages.len();
+
+    let mut stripped = 0usize;
+    let cleaned: Vec<String> = page_lines
+        .into_iter()
+        .map(|mut lines| {
+            let non_empty = lines.iter().filter(|l| !l.is_empty()).count();
+            if non_empty >= 2 {
+                stripped += strip_edge(&mut lines, true, &tops, strip_numbers);
+                stripped += strip_edge(&mut lines, false, &bottoms, strip_numbers);
+            }
+            lines.join("\n")
+        })
+        .collect();
+    (cleaned, stripped)
 }
 
 /// Extract PDF title/author from the trailer Info dictionary via lopdf.
@@ -115,10 +384,19 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
     let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
     let fallback_title = file_name.trim_end_matches(".pdf").to_string();
 
-    let paras = paragraphs_from_pages(&pages);
+    let (cleaned, stripped) = strip_page_furniture(&pages);
+    let paras = paragraphs_from_pages(&cleaned);
     if paras.is_empty() {
         return Err(AppError::msg(
             "no extractable text in this PDF — it may be a scanned document (OCR is not supported)",
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    if stripped > 0 {
+        warnings.push(format!(
+            "Skipped {stripped} header/footer line{} (running titles and page numbers).",
+            if stripped == 1 { "" } else { "s" }
         ));
     }
 
@@ -175,8 +453,8 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
                     .map(|b| b.text.chars().count())
                     .sum(),
             })
-            .collect(),
-        warnings: Vec::new(),
+                .collect(),
+        warnings,
     };
 
     Ok(LoadedBook {
@@ -191,6 +469,157 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_running_headers_with_embedded_numbers() {
+        let mut pages = Vec::new();
+        for i in 0..6usize {
+            // Verso: number + book title at the top. Recto: chapter title +
+            // number at the bottom — the classic alternation.
+            pages.push(
+                [
+                    format!("{} Early Buddhist Theory of Knowledge", 20 + i),
+                    String::new(),
+                    format!("Body paragraph {i} opens the page."),
+                    "more body text here".to_string(),
+                    String::new(),
+                    format!("Closing paragraph {i} of the verso."),
+                ]
+                .join("\n"),
+            );
+            pages.push(
+                [
+                    format!("Recto body starts {i} somewhere mid-sentence."),
+                    "continues down the page".to_string(),
+                    String::new(),
+                    format!("The Historical Background {}", 21 + i),
+                ]
+                .join("\n"),
+            );
+        }
+        let (cleaned, stripped) = strip_page_furniture(&pages);
+        assert_eq!(stripped, 12); // one header line per page
+        for p in &cleaned {
+            assert!(!p.contains("Early Buddhist Theory of Knowledge"));
+            assert!(!p.contains("The Historical Background"));
+        }
+        assert!(cleaned[0].contains("Body paragraph 0 opens the page."));
+        assert!(cleaned[0].contains("Closing paragraph 0 of the verso."));
+        assert!(cleaned[1].contains("Recto body starts 0"));
+    }
+
+    #[test]
+    fn strips_bare_page_numbers_in_many_dresses() {
+        let nums = ["12", "- 13 -", "[14]", "Page 15", "xvi", " p. 16 ", "2o", "i6"];
+        let mut pages = Vec::new();
+        for (i, n) in nums.iter().enumerate() {
+            pages.push(
+                [
+                    format!("Opening line {i} of real prose."),
+                    "second line".to_string(),
+                    String::new(),
+                    n.to_string(),
+                ]
+                .join("\n"),
+            );
+        }
+        let (cleaned, stripped) = strip_page_furniture(&pages);
+        assert_eq!(stripped, nums.len());
+        for p in &cleaned {
+            assert!(!p.trim().is_empty());
+            assert!(p.contains("real prose"));
+        }
+    }
+
+    #[test]
+    fn keeps_one_off_headings_and_divider_pages() {
+        let pages = vec![
+            "CHAPTER ONE\n\nThe chapter opens.".to_string(),
+            "Regular body text\n\non this page".to_string(),
+            "A different heading\n\nMore prose here.".to_string(),
+            "Even more prose\n\ncontinues".to_string(),
+            "Trailing page\n\nof the sample".to_string(),
+        ];
+        let (cleaned, stripped) = strip_page_furniture(&pages);
+        assert_eq!(stripped, 0);
+        assert!(cleaned[0].contains("CHAPTER ONE"));
+    }
+
+    #[test]
+    fn keeps_lone_numerals_and_years() {
+        // A single roman chapter numeral or bare year is content, not a page
+        // number — bare-number stripping needs the pattern to repeat.
+        let pages = vec![
+            "Intro text here\n\nsome prose".to_string(),
+            "II\n\nTHE PROBLEM OF KNOWLEDGE\n\nChapter body starts here.".to_string(),
+            "More body text\n\non this page".to_string(),
+            "In 1947 the events\n\nunfolded over years".to_string(),
+            "Final page of\n\nthe sample".to_string(),
+        ];
+        let (cleaned, stripped) = strip_page_furniture(&pages);
+        assert_eq!(stripped, 0);
+        assert!(cleaned[1].contains("II"));
+    }
+
+    #[test]
+    fn roman_guard_rejects_words() {
+        for w in ["civil", "mill", "mid", "did", "mix", "jolly", "zoo", "joy", "oil", "lily", "ill", "lol"] {
+            assert!(!token_is_numberish(w), "{w} must not count as a page number");
+        }
+        for n in ["xiv", "mmxxvi", "xvii"] {
+            assert!(token_is_numberish(n), "{n} should count as a page number");
+        }
+        // OCR-mangled numbers must count.
+        for n in ["i6", "2o", "3*", "j6", "6y", "ioo", "IOI", "I0", "16", "iv"] {
+            assert!(token_is_numberish(n), "{n} should be numberish");
+        }
+        assert_eq!(roman_value("iiv"), None);
+    }
+
+    #[test]
+    fn real_pdf_furniture_is_stripped() {
+        let Ok(bytes) =
+            std::fs::read("../Early Buddhist Theory of Knowledge - KN Jayatilleke_1-100.pdf")
+        else {
+            return; // local fixture only
+        };
+        let pages = pdf_extract::extract_text_from_mem_by_pages(&bytes).unwrap();
+        let (cleaned, stripped) = strip_page_furniture(&pages);
+        let headerish_tops: Vec<String> = cleaned
+            .iter()
+            .filter_map(|p| {
+                let ne: Vec<&str> = p.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                if ne.len() < 2 {
+                    return None;
+                }
+                let l = ne[0].to_lowercase();
+                let named = l.contains("early buddhist theory")
+                    || l.contains("historical background")
+                    || l.ends_with("foreword")
+                    || l.ends_with("preface")
+                    || l.ends_with("contents")
+                    || l.ends_with("abbreviations");
+                // True running headers carry a page number at an edge; body
+                // sentences merely quoting the book title must not match.
+                let numbered = ne[0]
+                    .split_whitespace()
+                    .any(|t| token_is_numberish(t.trim_matches(|c: char| !c.is_alphanumeric())));
+                (named && numbered).then(|| ne[0].to_string())
+            })
+            .collect();
+        for t in &headerish_tops {
+            println!("remaining header-like top: {t}");
+        }
+        println!(
+            "pages: {}, stripped: {stripped}, header-like tops remaining: {}",
+            pages.len(),
+            headerish_tops.len()
+        );
+        assert!(stripped > 60, "expected most pages to lose a header");
+        // Only the 2-page "Abbreviations" section (below the recurrence
+        // threshold) may survive.
+        assert_eq!(headerish_tops.len(), 1, "running headers should be gone");
+    }
 
     #[test]
     fn splits_paragraphs_on_blank_lines() {

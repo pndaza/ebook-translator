@@ -118,10 +118,14 @@ pub async fn start_job(
     let running = state.job_running.clone();
     let output = state.output.clone();
     let progress = state.progress.clone();
+    let cache = state.cache.clone();
+    let usage = state.usage.clone();
+    let auto_switch = state.settings.read().unwrap().auto_switch_model;
 
     tauri::async_runtime::spawn(async move {
         crate::job::run(
-            app, book, options, api_key, data_dir, cancel, running, output, progress,
+            app, book, options, api_key, data_dir, cache, usage, auto_switch, cancel, running,
+            output, progress,
         )
         .await;
     });
@@ -180,25 +184,80 @@ pub fn get_job_progress(state: State<'_, AppState>) -> Option<crate::types::JobP
     state.progress.lock().unwrap().clone()
 }
 
-/// Exact number of API requests the loaded book needs with the given model,
-/// computed with the same batching the job will run.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimateResult {
+    /// Requests the job will actually send (fully cached batches excluded).
+    pub requests: usize,
+    /// Batches every segment of which is already in the translation cache.
+    pub cached_batches: usize,
+}
+
+/// Number of API requests the loaded book needs with the given model,
+/// computed with the same batching the job will run and discounted by
+/// whatever the persistent translation cache already covers.
 #[tauri::command]
-pub async fn estimate_requests(state: State<'_, AppState>, model: String) -> Result<usize> {
+pub async fn estimate_requests(
+    state: State<'_, AppState>,
+    model: String,
+    target_lang: String,
+    custom_instructions: String,
+) -> Result<EstimateResult> {
     let book = state
         .book
         .lock()
         .unwrap()
         .clone()
         .ok_or_else(|| AppError::msg("load a book first"))?;
-    let n = tauri::async_runtime::spawn_blocking(move || {
-        let book = book.lock().unwrap();
-        let docs = match &book.source {
-            crate::types::BookSource::Epub { docs, .. }
-            | crate::types::BookSource::Pdf { docs, .. } => docs,
-        };
-        crate::job::build_batches(docs, &model).len()
+    let (batches, prefix) = {
+        let prefix = crate::cache::TranslationCache::prefix(&model, &target_lang, &custom_instructions);
+        let batches = tauri::async_runtime::spawn_blocking(move || {
+            let book = book.lock().unwrap();
+            let docs = match &book.source {
+                crate::types::BookSource::Epub { docs, .. }
+                | crate::types::BookSource::Pdf { docs, .. } => docs,
+            };
+            crate::job::build_batches(docs, &model)
+        })
+        .await
+        .map_err(|e| AppError::msg(format!("estimate task failed: {e}")))?;
+        (batches, prefix)
+    };
+    let cache = state.cache.lock().unwrap();
+    let cached_batches = batches
+        .iter()
+        .filter(|b| b.items.iter().all(|i| cache.get(&prefix, &i.text).is_some()))
+        .count();
+    Ok(EstimateResult {
+        requests: batches.len() - cached_batches,
+        cached_batches,
     })
-    .await
-    .map_err(|e| AppError::msg(format!("estimate task failed: {e}")))?;
-    Ok(n)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStatsResult {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+#[tauri::command]
+pub fn cache_stats(state: State<'_, AppState>) -> CacheStatsResult {
+    let (entries, bytes) = state.cache.lock().unwrap().stats();
+    CacheStatsResult { entries, bytes }
+}
+
+#[tauri::command]
+pub fn clear_cache(state: State<'_, AppState>) -> CacheStatsResult {
+    state.cache.lock().unwrap().clear();
+    CacheStatsResult {
+        entries: 0,
+        bytes: 0,
+    }
+}
+
+/// Today's request usage per model and the next quota-reset time.
+#[tauri::command]
+pub fn get_usage(state: State<'_, AppState>) -> crate::usage::UsageSnapshot {
+    state.usage.snapshot()
 }

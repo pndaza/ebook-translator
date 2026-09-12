@@ -5,6 +5,7 @@ import {
   onJobLog,
   onJobProgress,
   type BookInfo,
+  type JobOptions,
   type JobProgress,
   type Settings,
 } from "$lib/api";
@@ -27,6 +28,9 @@ export const app = $state({
   form: null as null | { lang: string; mode: string; model: string },
   // Language the current job runs with, used for the output filename.
   jobLang: "" as string,
+  // Options the current job was started with, so the sample footer can
+  // launch the matching full run.
+  lastOptions: null as JobOptions | null,
 });
 
 export async function init() {
@@ -66,4 +70,5 @@ export function resetBook() {
   app.savedPath = "";
   app.error = "";
   app.form = null;
+  app.lastOptions = null;
 }

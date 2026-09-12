@@ -10,6 +10,8 @@ pub struct Settings {
     pub model: String,
     pub mode: String,
     pub custom_instructions: String,
+    /// Continue on the next same-tier model when the daily quota dies.
+    pub auto_switch_model: bool,
 }
 
 impl Default for Settings {
@@ -20,6 +22,7 @@ impl Default for Settings {
             model: o.model,
             mode: o.mode,
             custom_instructions: o.custom_instructions,
+            auto_switch_model: true,
         }
     }
 }

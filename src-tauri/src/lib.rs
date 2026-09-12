@@ -1,3 +1,4 @@
+mod cache;
 mod commands;
 mod error;
 mod epub;
@@ -7,6 +8,7 @@ mod pdf;
 mod settings;
 mod state;
 mod types;
+mod usage;
 
 #[cfg(test)]
 mod debug_inspect;
@@ -36,6 +38,9 @@ pub fn run() {
                 eprintln!("settings: {e}");
                 Default::default()
             });
+            let cache =
+                cache::TranslationCache::open(&data_dir.join("cache"));
+            let usage = usage::UsageTracker::open(data_dir.join("usage.json"));
             app.manage(AppState {
                 settings: RwLock::new(loaded),
                 settings_path,
@@ -45,6 +50,8 @@ pub fn run() {
                 job_cancel: Arc::new(AtomicBool::new(false)),
                 job_running: Arc::new(AtomicBool::new(false)),
                 progress: Arc::new(Mutex::new(None)),
+                cache: Arc::new(Mutex::new(cache)),
+                usage: Arc::new(usage),
             });
             Ok(())
         })
@@ -59,6 +66,9 @@ pub fn run() {
             commands::get_current_book,
             commands::get_job_progress,
             commands::estimate_requests,
+            commands::cache_stats,
+            commands::clear_cache,
+            commands::get_usage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -32,6 +32,10 @@ pub struct JobOptions {
     pub mode: String, // "bilingual" | "translated"
     pub model: String,
     pub custom_instructions: String,
+    /// Translate only an opening sample of the book (preview before spending
+    /// requests on the full run).
+    #[serde(default)]
+    pub sample: bool,
 }
 
 impl Default for JobOptions {
@@ -41,6 +45,7 @@ impl Default for JobOptions {
             mode: MODE_TRANSLATED.into(),
             model: "gemini-3.5-flash-lite".into(),
             custom_instructions: String::new(),
+            sample: false,
         }
     }
 }
@@ -68,6 +73,14 @@ pub struct JobProgress {
     pub tokens_used: u64,
     pub error: Option<String>,
     pub output_ready: bool,
+    /// This run only translates an opening sample of the book.
+    pub sample: bool,
+    /// Segments served from the persistent translation cache (no request).
+    pub cached_segments: usize,
+    /// Job parameters, so the UI can rebuild its options after a reload.
+    pub model: String,
+    pub target_lang: String,
+    pub mode: String,
 }
 
 /// A single translatable text block inside a content document.
