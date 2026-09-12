@@ -12,3 +12,4 @@ vite.config.ts.timestamp-*
 # local agent/session dir
 .zcode/
 *.pdf
+out.txt

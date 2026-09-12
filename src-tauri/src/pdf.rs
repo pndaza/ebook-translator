@@ -375,10 +375,154 @@ fn chunk_chapters(paras: Vec<String>) -> Vec<Vec<String>> {
     chapters
 }
 
+/// Flatten the light markdown pdf-inspector emits (headings, emphasis,
+/// links, tables, code fences) into the plain paragraph text the pipeline
+/// expects. Blank lines — the paragraph structure — are preserved.
+fn strip_markdown(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    for line in md.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        // Code fences and table separator rows are pure markup.
+        if t.starts_with("```") || (t.starts_with('|') && t.contains("---")) {
+            continue;
+        }
+        let mut l = t.trim_start_matches('#').trim().to_string();
+        l = strip_links(&l);
+        l = l.replace("**", "").replace("__", "").replace('*', "");
+        if t.starts_with('|') {
+            l = l.replace('|', " ");
+        }
+        out.push_str(l.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// Reduce `[text](url)` to `text` without a regex dependency.
+fn strip_links(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        let Some(close_rel) = rest[open..].find(']') else {
+            break;
+        };
+        let close = open + close_rel;
+        let after = &rest[close..]; // starts with ']'
+        if let Some(end) = after.find(')').filter(|_| after.starts_with("](")) {
+            out.push_str(&rest[..open]);
+            out.push_str(&rest[open + 1..close]);
+            rest = &after[end + 1..];
+        } else {
+            out.push_str(&rest[..open + 1]);
+            rest = &rest[open + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract page texts with pdf-inspector (pure Rust, ToUnicode CMap-aware):
+/// the bundled fallback for fonts the built-in reader cannot decode.
+fn inspector_pages(bytes: &[u8]) -> Option<std::result::Result<Vec<String>, String>> {
+    match pdf_inspector::extract_pages_markdown_mem(bytes, None) {
+        Ok(res) => Some(Ok(res
+            .pages
+            .into_iter()
+            .map(|p| strip_markdown(&p.markdown))
+            .collect())),
+        Err(e) => Some(Err(format!("{e}"))),
+    }
+}
+
+/// Extract page texts with poppler's `pdftotext`, returning `None` when the
+/// binary is not installed. Final fallback after the bundled readers.
+/// Pages come back split on form feeds, matching the shape of
+/// `pdf_extract::extract_text_from_mem_by_pages`.
+fn pdftotext_pages(bytes: &[u8]) -> Option<std::result::Result<Vec<String>, String>> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("ebtr-{}-{stamp}.pdf", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        return Some(Err(e.to_string()));
+    }
+    // A file argument avoids stdin/stdout pipe deadlocks on large books;
+    // plain "pdftotext" first, then the Homebrew paths a GUI app misses
+    // because it launches without the user's shell PATH.
+    let result = ["pdftotext", "/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext"]
+        .iter()
+        .find_map(|bin| {
+            match std::process::Command::new(bin)
+                .arg("-enc")
+                .arg("UTF-8")
+                .arg(&tmp)
+                .arg("-")
+                .output()
+            {
+                // The tool ran: its verdict is final for every candidate.
+                Ok(out) => Some(if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let mut pages: Vec<String> =
+                        text.split('\u{c}').map(str::to_string).collect();
+                    if pages.last().is_some_and(|p| p.is_empty()) {
+                        pages.pop(); // trailing form feed after the last page
+                    }
+                    Ok(pages)
+                } else {
+                    Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => Some(Err(e.to_string())),
+            }
+        });
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 /// Parse a PDF into synthesized chapter documents ready for translation.
 pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
-    let pages = pdf_extract::extract_text_from_mem_by_pages(&bytes)
-        .map_err(|e| AppError::msg(format!("could not extract PDF text: {e}")))?;
+    // pdf-extract silently returns empty pages for fonts it cannot decode
+    // (e.g. CID/Identity-H). Chain: built-in reader → pdf-inspector
+    // (bundled, ToUnicode-aware) → poppler's pdftotext.
+    let has_text =
+        |p: &[String]| p.iter().any(|page| !page.trim().is_empty());
+    let mut fallback_note = String::new();
+    let pages = match pdf_extract::extract_text_from_mem_by_pages(&bytes) {
+        Ok(p) if has_text(&p) => p,
+        extract => {
+            let mut chain: Option<Vec<String>> = None;
+            if let Some(Ok(p)) = inspector_pages(&bytes).filter(|r| r.as_ref().is_ok_and(|p| has_text(p))) {
+                fallback_note = "pdf-inspector".into();
+                chain = Some(p);
+            } else if let Some(Ok(p)) =
+                pdftotext_pages(&bytes).filter(|r| r.as_ref().is_ok_and(|p| has_text(p)))
+            {
+                fallback_note = "pdftotext (poppler)".into();
+                chain = Some(p);
+            }
+            match chain {
+                Some(p) => p,
+                // Every reader failed or found nothing: report the most
+                // specific error we have.
+                None => {
+                    return Err(match extract {
+                        Err(e) => {
+                            AppError::msg(format!("could not extract PDF text: {e}"))
+                        }
+                        Ok(_) => AppError::msg(
+                            "no reader could find text in this PDF — it is likely a \
+                             scanned document (OCR is not supported)",
+                        ),
+                    });
+                }
+            }
+        }
+    };
 
     let (meta_title, meta_author) = metadata(&bytes);
     let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
@@ -393,6 +537,11 @@ pub fn parse(bytes: Vec<u8>, file_path: &str) -> Result<LoadedBook> {
     }
 
     let mut warnings = Vec::new();
+    if !fallback_note.is_empty() {
+        warnings.push(format!(
+            "Text extracted with {fallback_note} — the built-in reader found none."
+        ));
+    }
     if stripped > 0 {
         warnings.push(format!(
             "Skipped {stripped} header/footer line{} (running titles and page numbers).",
@@ -622,6 +771,22 @@ mod tests {
     }
 
     #[test]
+    fn markdown_is_flattened_to_plain_paragraphs() {
+        let md = "# Preface\n\nSome **bold** and *italic* text.\n\n|Dhp|Dhammapada|\n|---|---|\n|AN|Aṅguttara|\n\nSee [the license](https://example.com) for details.\n```\ncode\n```\n";
+        let plain = strip_markdown(md);
+        assert!(plain.contains("Preface\n"));
+        assert!(plain.contains("Some bold and italic text."));
+        assert!(plain.contains("Dhp Dhammapada"));
+        assert!(plain.contains("AN Aṅguttara"));
+        assert!(plain.contains("See the license for details."));
+        assert!(!plain.contains('['));
+        assert!(!plain.contains('|'));
+        assert!(!plain.contains('#'));
+        assert!(!plain.contains("```"));
+        assert!(!plain.contains("---"));
+    }
+
+    #[test]
     fn splits_paragraphs_on_blank_lines() {
         let pages = vec!["One two\nthree\n\nFour five".to_string()];
         let paras = paragraphs_from_pages(&pages);
@@ -644,3 +809,43 @@ mod tests {
         assert!(chapters.iter().all(|c| !c.is_empty()));
     }
 }
+
+#[cfg(test)]
+mod wings_fixture {
+    use super::*;
+
+    // Local fixture only; skips silently when the PDF is absent.
+    #[test]
+    fn cid_font_pdf_parses_via_inspector_fallback() {
+        let Ok(bytes) = std::fs::read("../Wings To Awakening - Thanissaro.pdf") else {
+            return;
+        };
+        // The built-in reader genuinely finds nothing in this file: every
+        // font is CID Type 0C with Identity-H encoding.
+        let builtin = pdf_extract::extract_text_from_mem_by_pages(&bytes).unwrap();
+        assert!(!builtin.iter().any(|p| !p.trim().is_empty()));
+
+        let book = parse(bytes, "/tmp/Wings To Awakening - Thanissaro.pdf").unwrap();
+        assert!(book.info.total_chars > 100_000, "got {}", book.info.total_chars);
+        assert!(!book.info.segments.is_empty());
+        assert!(
+            book.info.warnings.iter().any(|w| w.contains("pdf-inspector")),
+            "fallback should be flagged: {:?}",
+            book.info.warnings
+        );
+        // Markdown syntax must not leak into translatable text.
+        let docs = match &book.source {
+            crate::types::BookSource::Pdf { docs, .. } => docs,
+            _ => unreachable!(),
+        };
+        assert!(
+            docs.iter()
+                .flat_map(|d| d.blocks.iter())
+                .filter(|b| !b.skipped)
+                .all(|b| !b.text.contains("**") && !b.text.contains("](")),
+            "markdown artifacts leaked into blocks"
+        );
+    }
+}
+
+
